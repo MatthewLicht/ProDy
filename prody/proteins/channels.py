@@ -13,20 +13,21 @@ from collections import namedtuple
 from contextlib import contextmanager
 
 import numpy as np
+
 from prody import LOGGER, PY3K
 from prody.atomic import Atomic
 from prody.utilities import getCoords, isListLike
 from prody.proteins import writePDB, parsePDB, parsePQR
 from prody.ensemble import Ensemble
-from prody.measure import calcCenter
+from prody.trajectory import Trajectory
+from prody.measure import calcCenter, calcTransformation, calcDistance, calcRMSD, superpose
 
 if not hasattr(np, "trapz"):
     np.trapz = np.trapezoid
 
-__all__ =['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames', 
+__all__ = ['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames', 
            'getChannelParameters', 'getChannelAtoms', 'showChannels', 
            'showCavities', 'showSurfaceCavities', 'selectChannelBySelection', 
-           'getChannelResidueNames',
            'getChannelLiningInfo',
            'calcChannelSurfaceOverlaps', 'calcSurfaceCavities', 
            'calcSurfaceCavitiesMultipleFrames', 'getSurfaceCavityParameters',
@@ -35,16 +36,32 @@ __all__ =['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames',
            'getSurfaceCavityResidueNamesMultipleFrames',
            'getSurfaceCavityParametersMultipleFrames', 
            'getChannelParametersMultipleFrames', '_reportAtomsInputComposition',
-           'getChannelLiningInfoMultipleFrames',
-           'getChannelResidueNamesMultipleFrames', 'calcPoresFromChannels',
-           'showPores', 'getPoreParameters', 'getPoreResidueNames',
+           'getChannelLiningInfoMultipleFrames', 'calcPoresFromChannels',
+           'showPores', 'getPoreParameters', 'getPoreLiningInfo', 
            'calcPoresFromChannelsMultipleFrames', 'getPoreParametersMultipleFrames',
-           'getPoreResidueNamesMultipleFrames', 'scanChannelParameters',
-           'getLinkParameters', 'getLinkResidueNames',
-           'getLinkParametersMultipleFrames', 'getLinkResidueNamesMultipleFrames',
-           'scanSurfaceCavityParameters', 'connectChannelsToSurfaceCavities',
+           'getPoreLiningInfoMultipleFrames', 'scanChannelParameters',
+           'getLinkParameters', 'getLinkLiningInfo',
+           'getLinkParametersMultipleFrames', 'getLinkLiningInfoMultipleFrames',
+           'scanSurfaceCavityParameters',
+           'calcFrequentObjectResidues', 'showFrequentObjectResidues',
+           'connectChannelsToSurfaceCavities',
            'calcFrequentObjectResidues', 'showFrequentObjectResidues',
            'writeChannelsCIF']
+
+# Sampling of the enclosure test used to strip the moat (see
+# ChannelCalculator.calcEnclosure). These are constants, not knobs: the enclosure
+# of a point depends on how many directions are sampled and how far they are
+# followed, so min_enclosure is only meaningful against a fixed sampling. Adding
+# rays lowers every enclosure, since more directions find more of the thin ways
+# out of a channel, and so invalidates the threshold rather than refining it.
+ENCLOSURE_RAYS = 32
+ENCLOSURE_RANGE = 25.0
+ENCLOSURE_STEP = 0.75
+# One radius for every atom, on the scale of a heavy-atom vdW radius. Enclosure is
+# a burial heuristic, so resolving 1.52 A from 1.7 A would only shift every value
+# by a little and be absorbed by min_enclosure; a single radius means a single
+# tree and a plain nearest-neighbour test.
+ENCLOSURE_RADIUS = 1.7
 
 # Van der Waals radii in Angstrom, by element symbol (upper case). The radii the
 # tessellation is built on, and the ones the lining report measures a Voronoi
@@ -193,6 +210,7 @@ _CHARGED_RESIDUES = {'ARG': 1, 'LYS': 1, 'HIS': 1, 'ASP': -1, 'GLU': -1}
 _IONIZABLE_RESIDUES = frozenset(['ASP', 'GLU', 'HIS', 'CYS', 'TYR', 'LYS',
                                  'ARG'])
 
+
 _OVERLAP_OFFSET_CACHE = {}
 
 # The tag a per-object file carries in its name, against the word the same
@@ -202,6 +220,7 @@ _OVERLAP_OFFSET_CACHE = {}
 # _channel0.pqr to _chl0.pqr.
 _OBJECT_TAGS = {'chl': 'channel', 'lnk': 'link', 'pore': 'pore',
                 'cavity': 'cavity'}
+
 
 @contextmanager
 def _warningsDelivered():
@@ -312,7 +331,6 @@ def _numberedPath(filename, tag, index, suffix='', stem=None):
         stem = path.stem
     return path.with_name("{0}{1}{2}{3}{4}".format(
         stem + '_' if stem else '', tag, index, suffix, path.suffix))
-
 
 def _frameBounds(n_frames, start_frame=0, stop_frame=-1):
     """Half-open ``[first, last)`` over the 0-based frames a run covers.
@@ -522,7 +540,7 @@ def _surfaceFromPqrWorker(args):
         surface.update(map(tuple, voxels))
 
     return surface
-
+    
 
 def _calcChannelsMultipleFramesWorker(args):
     """Compute channels. Supporting function for muliprocessing in :func:`calcChannelsMultipleFrames`."""
@@ -558,7 +576,6 @@ def _calcChannelsMultipleFramesWorker(args):
         return frame_nr, channels, surfaces, details
     return frame_nr, channels, surfaces
 
-
 def _calcSurfaceCavitiesMultipleFramesWorker(args):
     """Compute surface cavities. Supporting function for multiprocessing in :func:`calcSurfaceCavitiesMultipleFrames`."""
     frame_nr, atoms, frame_coords, frame_output_path, separate, kwargs = args
@@ -569,7 +586,6 @@ def _calcSurfaceCavitiesMultipleFramesWorker(args):
 
     return calcSurfaceCavities(atoms_copy, output_path=frame_output_path, separate=separate, **kwargs)
     
-
 def _calcPoresFromChannelsWorker(args):
     """Reconstruct pores from channels. Supporting function for multiprocessing
     in :func:`calcPoresFromChannelsMultipleFrames`."""
@@ -577,7 +593,6 @@ def _calcPoresFromChannelsWorker(args):
     LOGGER.info("Frame/model: {0}".format(frame_nr))
     return calcPoresFromChannels(channels, details, output_path=output_path,
                                  separate=separate, **kwargs)
-
 
 def _findContactRun(mask, min_contact_points):
     """Return the first index of the last valid contiguous True run in *mask*.
@@ -1142,13 +1157,12 @@ def showChannels(channels, model=None, surface=None):
     conda install open3d (for Anaconda users; version open3d-0.19.0 was used 
     during the development) or pip install open3d
     
-    :arg channels: A list of channel objects or a single channel object. Each
-        channel should have a `getSplines()` method that returns two
-        interpolators over one parameter domain: one for the centerline and one
-        for the radii.
+    :arg channels: A list of channel objects or a single channel object. Each 
+        channel should have a `getSplines()` method that returns two 
+        CubicSpline objects: one for the centerline and one for the radii.
     :type channels: list or single channel object
-
-    :arg model: An optional Open3D TriangleMesh object representing the
+    
+    :arg model: An optional Open3D TriangleMesh object representing the 
         molecular model, such as a protein. If provided, this model will be 
         rendered in the visualization.
         Model can be generated using getVmdModel() function.
@@ -3114,8 +3128,7 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
             _writeVisScript(output_path.parent, 'pore*.pqr')
 
     return pores
-
-
+            
 def connectChannelsToSurfaceCavities(channels, channel_details, cavities,
     cavity_surface, tolerance=1.0, min_contact_points=2, cavity_margin=2.0,
     output_path=None, separate=False):
@@ -3353,7 +3366,7 @@ def connectChannelsToSurfaceCavities(channels, channel_details, cavities,
         _saveConnectedCavityChannels(connected, cavity_surface, output_path, separate=separate)
 
     return connected
-            
+
 def calcChannelsMultipleAtomGroups(atomgroups, output_path=None, 
     separate=False, max_proc=2,start_point = None, mp_context=None,filenames = None,**kwargs):
     """Calculate channels for multiple atom groups."""
@@ -3439,6 +3452,7 @@ def calcChannelsMultipleAtomGroups(atomgroups, output_path=None,
 
     return channels_all, surfaces_all, failed_idx
 
+              
 def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None, 
     separate=False, start_point=None, max_proc=2, mp_context=None, **kwargs):
     """Compute channels for each frame in a given trajectory or multi-model 
@@ -3469,13 +3483,11 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         Default is False.
     :type separate: bool
 
-    :arg start_point: Optional starting point for channel search, applied to every
-        frame. If provided, the search is restricted to the cavity holding the
-        tetrahedron nearest the point and is seeded there, overriding the default
-        automatic seed selection; see :func:`calcChannels` for how the seed is
-        picked and for ``start_point_search``, which bounds how far from the point
-        it may lie. Coordinates must be given in Å.
-    :type start_point: list, tuple, or ndarray (length 3), or None
+    :arg start_point: Optional starting point for channel search. If provided, 
+        the algorithm will use the tetrahedron whose Voronoi vertex is closest 
+        to this point as the starting tetrahedron (overriding the default automatic 
+        seed selection based on the deepest tetrahedron). Coordinates must be given in Å.
+    :type start_point: list, tuple, or ndarray (length 3), or None 
 
     :arg max_proc: Maximum number of parallel processes used for calculation. 
         If 1, files are processed serially. If None, all available CPU
@@ -3504,8 +3516,8 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
 
     Example usage:
     channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
-                                    output_path="channels.pdb", separate=False, surf_radius=15,
-                                    inner_radius=1.2, min_depth=5, bottleneck=1, sparsity=6)
+                                    output_path="channels.pdb", separate=False, surf_radius=3, 
+                                    inner_radius=0.9, min_depth=5, bottleneck=1, sparsity=3)
                                   
     channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
                                     output_path="channels.pdb", separate=False, 
@@ -3534,68 +3546,49 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
     return_details = kwargs.pop('return_details', False)
     start_frame = kwargs.pop('start_frame', 0)
     stop_frame = kwargs.pop('stop_frame', -1)
-
-    # Read rather than popped: the worker forwards the rest of kwargs to
-    # calcChannels, which is where the format takes effect. It is wanted here only
-    # to name the per-frame files. The schema describes one structure and has no
-    # frame of its own, so a frame per file is what keeps each written file
-    # something the schema can describe - the same arrangement the PQR path uses.
-    frame_suffix = '.cif' if _isMmcifFormat(
-        kwargs.get('output_format', 'pqr'), separate) else '.pqr'
-
+    
     if output_path:
         output_path = Path(output_path)
-        if output_path.suffix in ('.pqr', '.cif'):
+        if output_path.suffix == ".pqr":
             output_path = output_path.with_suffix('')
 
     if trajectory is not None:
-        if isinstance(trajectory, Atomic):
-            trajectory = Ensemble(trajectory)
+        if not isinstance(trajectory, Trajectory) and not isinstance(trajectory, Ensemble):
+            raise ValueError("trajectory must be a Trajectory or Ensemble object.")
 
-        # `_nfi` is a DCD read cursor, so only a file-backed trajectory has one;
-        # an Ensemble holds its coordinates in memory and has nothing to rewind.
-        # Reading it unguarded made every in-memory input raise, the conversion
-        # just above included - the one branch written to accept an Atomic turned
-        # it into the very type that could not survive the next line.
-        nfi = getattr(trajectory, '_nfi', None)
-        if hasattr(trajectory, 'reset'):
-            trajectory.reset()
-
-        first, last = _frameBounds(None, start_frame, stop_frame)
-        traj = trajectory[first:last]
-
-        atoms_copy = atoms.copy()
-        for j0, frame0 in enumerate(traj, start=first):
+        if stop_frame == -1:
+            traj = trajectory[start_frame:]
+        else:
+            traj = trajectory[start_frame:stop_frame+1]
+        
+        
+        for j0, frame0 in enumerate(traj, start=start_frame):
             if output_path:
-                frame_output_path = _frameOutputPath(output_path, j0, "channels",
-                                                     frame_suffix)
+                frame_output_path = _frameOutputPath(output_path, j0, "channels")
+            else:
+                frame_output_path = None
+            atoms_copy = atoms.copy()
+            tasks.append((j0, atoms_copy, np.array(frame0.getCoords(), copy=True),
+                            frame_output_path, separate, start_point, return_details, kwargs))
+
+    elif atoms.numCoordsets() > 1:
+        # if not atoms.numCoordsets() > 1:
+        #     atoms.addCoordset(trajectory.getCoordsets())
+        coordsets = atoms.getCoordsets()
+        for i in range(len(atoms.getCoordsets()[start_frame:stop_frame])):
+            model_nr = i + start_frame
+
+            if output_path:
+                frame_output_path = _frameOutputPath(output_path, model_nr,
+                                                    "channels")
             else:
                 frame_output_path = None
             
-            tasks.append((j0, atoms_copy, np.array(frame0.getCoords(), copy=True),
+            tasks.append((model_nr, atoms, np.array(coordsets[model_nr], copy=True),
                             frame_output_path, separate, start_point, return_details, kwargs))
-        if nfi is not None:
-            trajectory._nfi = nfi
-
+            
     else:
-        if atoms.numCoordsets() > 1:
-            coordsets = atoms.getCoordsets()
-            first, last = _frameBounds(len(coordsets), start_frame, stop_frame)
-            for model_nr in range(first, last):
-
-                if output_path:
-                    frame_output_path = _frameOutputPath(output_path, model_nr,
-                                                         "channels",
-                                                         frame_suffix)
-                else:
-                    frame_output_path = None
-                
-                tasks.append((model_nr, atoms, np.array(coordsets[model_nr], copy=True),
-                                frame_output_path, separate, start_point, return_details, kwargs))
-                
-        else:
-            LOGGER.info("Include trajectory or use multi-model PDB file.")
-
+        LOGGER.info("Include trajectory or use multi-model PDB file.")
 
     import multiprocessing
 
@@ -3608,9 +3601,10 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         max_proc = multiprocessing.cpu_count()
 
     max_proc = max(1, min(int(max_proc), len(tasks)))
-
+    chunksize = max(1, len(tasks)//(max_proc*4))
     if max_proc == 1:
-        results = [_calcChannelsMultipleFramesWorker(task) for task in tasks]
+        results = [_calcChannelsMultipleFramesWorker(task)
+                    for task in tasks]
     else:
         if mp_context is None:
             ctx = multiprocessing.get_context()
@@ -3618,22 +3612,23 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
             ctx = multiprocessing.get_context(mp_context)
 
         with ctx.Pool(processes=max_proc) as pool:
-            results = pool.map(_calcChannelsMultipleFramesWorker, tasks)
-
+            results = pool.map(_calcChannelsMultipleFramesWorker, tasks,chunksize=chunksize)
+    
+    results.sort(key=lambda x: x[0])
     for result in results:
         if return_details:
-            channels, surfaces, details = result
+            _, channels, surfaces, details = result
             details_all.append(details)
         else:
-            channels, surfaces = result
+            _, channels, surfaces = result
 
         channels_all.append(channels)
         surfaces_all.append(surfaces)
-    
+
     for channels in channels_all:
         for channel in channels:
             channel._buildSplines()
-    
+
     output_format = kwargs.get('output_format', 'pqr')
     if output_path is not None and Path(output_path).is_dir() and (output_format == 'mmcif' or separate):
         channel_pattern = 'channels.cif' if output_format == 'mmcif' else 'chl*.pqr'
@@ -3744,20 +3739,19 @@ def calcSurfaceCavitiesMultipleFrames(atoms, trajectory=None, output_path=None,
             output_path = output_path.with_suffix('')
 
     if trajectory is not None:
-        if isinstance(trajectory, Atomic):
+        if isinstance(trajectory,Atomic):
             trajectory = Ensemble(trajectory)
 
-        # As in calcChannelsMultipleFrames: only a file-backed trajectory carries
-        # a read cursor, and an in-memory one has nothing to save or rewind.
-        nfi = getattr(trajectory, '_nfi', None)
-        if hasattr(trajectory, 'reset'):
-            trajectory.reset()
-
-        first, last = _frameBounds(None, start_frame, stop_frame)
-        traj = trajectory[first:last]
+        nfi = trajectory._nfi
+        trajectory.reset()
+        
+        if stop_frame == -1:
+            traj = trajectory[start_frame:]
+        else:
+            traj = trajectory[start_frame:stop_frame + 1]
 
         atoms_copy = atoms.copy()
-        for j0, frame0 in enumerate(traj, start=first):
+        for j0, frame0 in enumerate(traj, start=start_frame):
             if output_path:
                 frame_output_path = _frameOutputPath(output_path, j0,
                                                      "cavities")
@@ -3767,16 +3761,18 @@ def calcSurfaceCavitiesMultipleFrames(atoms, trajectory=None, output_path=None,
             tasks.append((j0, atoms_copy, np.array(frame0.getCoords(), copy=True),
                           frame_output_path, separate, kwargs))
 
-        if nfi is not None:
-            trajectory._nfi = nfi
+        trajectory._nfi = nfi
 
     else:
         if atoms.numCoordsets() > 1:
             coordsets = atoms.getCoordsets()
 
-            first, last = _frameBounds(len(coordsets), start_frame, stop_frame)
+            if stop_frame == -1:
+                model_indices = range(start_frame, len(coordsets))
+            else:
+                model_indices = range(start_frame, stop_frame + 1)
 
-            for i in range(first, last):
+            for i in model_indices:
                 if output_path:
                     frame_output_path = _frameOutputPath(output_path, i,
                                                          "cavities")
@@ -3885,25 +3881,18 @@ def calcPoresFromChannelsMultipleFrames(channels_all, details_all, output_path=N
     if len(channels_all) != len(details_all):
         raise ValueError("channels_all and details_all must contain the same number of frames")
 
-    # Read rather than popped: the worker forwards the rest of kwargs to
-    # calcPoresFromChannels, where the format takes effect. Wanted here only to
-    # name the per-frame files.
-    mmcif = _isMmcifFormat(kwargs.get('output_format', 'pqr'), separate)
-    frame_suffix = '.cif' if mmcif else '.pqr'
-
     # A directory takes the frames inside it, as everywhere else; anything else
     # is the name they are numbered from, as before.
     into_directory = output_path is not None and os.path.isdir(str(output_path))
     if output_path is not None and not into_directory:
         output_path = Path(output_path)
-        if output_path.suffix not in ('.pqr', '.pdb', '.cif'):
-            output_path = output_path.with_suffix(frame_suffix)
+        if output_path.suffix not in ('.pqr', '.pdb'):
+            output_path = output_path.with_suffix('.pqr')
 
     tasks = []
     for frame_nr, (channels, details) in enumerate(zip(channels_all, details_all)):
         if into_directory:
-            frame_output_path = _frameOutputPath(output_path, frame_nr, "pores",
-                                                 frame_suffix)
+            frame_output_path = _frameOutputPath(output_path, frame_nr, "pores")
         elif output_path is not None:
             frame_output_path = output_path.with_name(
                     "{0}_frame{1}{2}".format(output_path.stem, frame_nr, output_path.suffix))
@@ -4155,7 +4144,7 @@ def getChannelParametersMultipleFrames(channels_all, trajectory=None, **kwargs):
 
     :arg trajectory: The trajectory the frames came from, if any. Only its
         presence is used, to name the files ``_frame<i>`` rather than
-        ``_model<i>``, matching :func:`getChannelResidueNamesMultipleFrames`.
+         ``_model<i>``, matching :func:`getChannelLiningInfoMultipleFrames`.
     :type trajectory: :class:`.Atomic`, :class:`.Ensemble`, or trajectory-like object
 
     :arg param_file_name: base name for the output parameter files. If provided,
@@ -4516,7 +4505,6 @@ def getChannelAtoms(channels, protein=None, num_samples=5):
     channels_atomic = convert_lines_to_atomic(pdb_lines)
     return channels_atomic
 
-
 def _atomRadii(atoms, warn=True):
     """Van der Waals radius of every atom of *atoms*, from :data:`VDW_RADII`.
 
@@ -4535,7 +4523,6 @@ def _atomRadii(atoms, warn=True):
         elements = np.zeros(atoms.numAtoms(), dtype='<U2')
     return ChannelCalculator.getVdwRadii(elements, warn=warn)
 
-
 def _vertexRadiiSource(atoms):
     """``(tree, vdw_radii)`` over the atoms a tessellation would have used.
 
@@ -4549,9 +4536,9 @@ def _vertexRadiiSource(atoms):
     if dry is None:
         dry = atoms
 
-    # Silent: getSurfaceCavityResidueNames has already measured the same atoms
-    # through _liningSource, which said whatever there was to say about them.
-    return _kdTree(dry), _atomRadii(dry, warn=False)
+    vdw = ChannelCalculator.getVdwRadii(
+        np.char.upper(np.asarray(dry.getElements(), dtype=str)))
+    return _kdTree(dry), vdw
 
 
 def _vertexRadii(points, source, k=24):
@@ -4570,7 +4557,6 @@ def _vertexRadii(points, source, k=24):
         distances, indices = distances[:, None], indices[:, None]
     return (distances - vdw[indices]).min(axis=1)
 
-
 def _liningSource(atoms):
     """``(tree, coords, vdw_radii)`` for the lining queries over *atoms*.
 
@@ -4588,7 +4574,6 @@ def _liningSource(atoms):
     report rather than the trace that meets an uncovered element first."""
 
     return _kdTree(atoms), atoms.getCoords(), _atomRadii(atoms)
-
 
 def _liningContacts(source, points, radii, distA, deep=None):
     """Every (probe, atom) pair whose surfaces come within *distA* of each other.
@@ -4659,7 +4644,6 @@ def _liningContacts(source, points, radii, distA, deep=None):
 
     return probes[within], candidates[within], gaps[within]
 
-
 def _liningResidues(atoms, source, points, radii, distA, deep=None):
     """Whole residues of *atoms* whose surface comes within *distA* of the probe's.
 
@@ -4707,7 +4691,6 @@ def _liningResidues(atoms, source, points, radii, distA, deep=None):
         return atoms.getAtomGroup()[atoms.getIndices()[selected].tolist()]
     return atoms[selected.tolist()]
 
-
 def _reportDeepLiningAtoms(atoms, deep):
     """Name the residues lying inside the route rather than beside it.
 
@@ -4734,7 +4717,6 @@ def _reportDeepLiningAtoms(atoms, deep):
                 "not part of the tessellation the channels came from.".format(
                     len(labels), ', '.join(labels[:8]) +
                     (', ...' if len(labels) > 8 else ''), -min(deep.values())))
-
 
 def _oneLetterResname(residue):
     """One-letter code for an amino acid or a nucleotide, residue name for the rest.
@@ -4791,6 +4773,52 @@ def _popLiningOptions(kwargs):
         one_letter_aa=kwargs.pop('one_letter_aa', False),
         include_water=kwargs.pop('include_water', False),
         include_chain=kwargs.pop('include_chain', True))
+
+
+def _formatLiningResidues(residues, options):
+    """Label every residue in *residues* as ``<resname><resnum>:<chain>``, one each.
+
+    *options* are the :func:`_popLiningOptions` settings of the calling report.
+
+    The residue is read from the hierarchical view rather than from a representative
+    atom. Standing for a residue by its ``CA`` silently dropped everything that has
+    none -- nucleic acids, cofactors, ligands, ions -- although those atoms line the
+    channel and enter the calculation exactly as protein atoms do, and it raised
+    :exc:`AttributeError` where a channel was lined by no protein at all.
+
+    The chain is written unless *include_chain* is false, because without it a
+    residue number is not an identifier: an oligomer lines a channel with residues of
+    the same number from several chains, and the report then names one residue twice
+    instead of naming two. The chain needs a separator of its own, since an
+    insertion code already sits directly behind the number and ``ASP100A`` is taken.
+    A colon separates it, and the entry prefix written by the callers remains
+    unambiguous, as it is a colon *and a space*. A structure with no chain
+    identifiers gets no separator either.
+
+    Waters are left out unless *include_water*: :func:`calcChannels` drops them
+    before tessellating, so they shape no channel, and being reported one entry per
+    molecule they would bury the lining of a solvated structure under hundreds of
+    HOH. FIL pseudoatoms are always dropped, in case a structure has a chain and
+    residue number colliding with the ones :func:`getChannelAtoms` writes for
+    them."""
+
+    if residues is None:
+        return []
+
+    residues = residues.select('not resname FIL' if options.include_water
+                               else 'not water and not resname FIL')
+    if residues is None:
+        return []
+
+    labels = []
+    for residue in residues.getHierView().iterResidues():
+        resname = (_oneLetterResname(residue) if options.one_letter_aa
+                   else residue.getResname())
+        chid = residue.getChid().strip() if options.include_chain else ''   
+        labels.append('{0}{1}{2}{3}'.format(resname, residue.getResnum(),
+                                            residue.getIcode().strip(),
+                                            ':' + chid if chid else ''))
+    return labels
 
 def _liningResindexMask(resindices, tree, points, radii, buffer=2.5):
     from itertools import chain
@@ -4853,6 +4881,7 @@ def _getResidueOrientation(context):
     n /= np.linalg.norm(n, axis=1, keepdims=True)
 
     return np.einsum("ij,ij->i", v, n)
+
 
 def _saveLiningInfo(info,filepath,**kwargs):
     """
@@ -5022,6 +5051,7 @@ def _liningResindexMaskFromContacts(resindices,source,points,radii,distA,deep=No
     mask = np.isin(resindices,lining_resindices)
     return mask, atom_gaps
 
+
 def _getLiningResidues(context):
     """Return unique residue labels for residues lining the object."""
     from prody.atomic.atomic import AAMAP
@@ -5050,6 +5080,7 @@ def _getLiningResidues(context):
     if context['options'].include_chain:
         labels = np.char.add(labels,np.char.add(':', chains.astype(str)),)
     return np.unique(labels).tolist()
+
 
 def getObjectLiningInfo(atoms, objects, object_type='channel',
                         callbacks=None, **kwargs):
@@ -5164,110 +5195,6 @@ def getObjectLiningInfo(atoms, objects, object_type='channel',
         LOGGER.info("Lining Info was saved to: {0}".format(output_file))
         
     return info
-
-def getObjectResidueNames(atoms, objects, object_type='channel', **kwargs):
-    '''Provides the resnames and resid of residues that are forming the object(s). 
-    Residues are extracted based on distA, the clearance between the surface of
-    the FIL atoms (object atoms) and the van der Waals surface of the residue's
-    own atoms.
-    Results could be save as txt file by providing the `residues_file_name` parameter.
-    
-    :arg atoms: an Atomic object from which residues are selected 
-    :type atoms: :class:`.Atomic`
-
-    :arg objects: A list of objects. Each object has a method 
-        `getSplines()` that returns the centerline spline and radius spline of 
-        the object.
-    :type objects: list
-    
-    :arg object_type: Type of the object; "channel", "pore" or "link".
-        Default is "channel".
-    :type object_type: str
-
-    :arg distA: Residues reaching within this distance of the object's surface
-        are reported. It is a clearance between surfaces: the local probe radius
-        and the atom's van der Waals radius are both taken off, so a touching
-        atom sits at 0 and the reach is the same in a wide part of the object as
-        in a narrow one, and the same at a hydrogen as at a potassium ion.
-        Default is 1.5 [Ang]
-    :type distA: int, float
-    
-    :arg residues_file_name: The file with residues will be saved in a text 
-        file with the provided name. Use one word which will be added to 
-        '_Residues_All_{object_type}.txt' sufix. If further analysis will be 
-        performed with selectChannelBySelection() function, the preferable 
-        residues_file_name is PDB+chain for example: '1bbhA'.
-    :type residues_file_name: str  
-    
-    :arg one_letter_aa: Whether to apply 1-latter code to residue name
-        by defult is False. Only amino acids and nucleotides are translated;
-        ligands, cofactors and ions keep their residue name, so that the ion K
-        stays K rather than being read as a lysine.
-    :type one_letter_aa: bool
-
-    :arg include_water: Whether to list water molecules among the lining
-        residues. They are reported one entry per molecule, so a solvated
-        structure gives hundreds of them. Default is False.
-    :type include_water: bool
-
-    :arg include_chain: Whether to append the chain identifier to each residue,
-        as ``ASP108:A``. Default is True: without it a residue number does not
-        identify a residue, since an oligomer lines a channel with residues of
-        the same number from several chains. Pass False for the plain
-        ``ASP108`` labels written by earlier versions.
-    :type include_chain: bool  '''
-
-    _requireCoords(atoms)
-
-    plurals = {'channel': 'channels', 'pore': 'pores', 'link': 'links'}
-    if object_type not in plurals:
-        raise ValueError("object_type must be 'channel', 'pore' or 'link'")
-
-    options = _popLiningOptions(kwargs)
-
-    source = _liningSource(atoms)
-    deep = {}
-
-    if isinstance(objects, list):
-        # Multiple objects
-        selected_residues_ch = []
-
-        for i, object in enumerate(objects):
-            points, radii = _sampleObjectSpheres(object)
-            residues = _liningResidues(atoms, source, points, radii,
-                                       options.distA, deep)
-            residues_info = _formatLiningResidues(residues, options)
-
-            # An object with no lining left is reported as "None" rather than
-            # skipped, so that the returned list keeps one entry per object.
-            residues_list = ", ".join(residues_info) if residues_info else "None"
-            residues_list = object_type + str(i) + ': ' + residues_list
-            selected_residues_ch.append(residues_list)
-
-    else:
-        # Single object analysis in case someone provide objects[0]
-        points, radii = _sampleObjectSpheres(objects)
-        residues = _liningResidues(atoms, source, points, radii, options.distA,
-                                   deep)
-        residues_info = _formatLiningResidues(residues, options)
-        selected_residues_ch = [", ".join(residues_info) if residues_info else "None"]
-
-    # Once for the whole report, not once per object: a cofactor lines several
-    # channels of the same protein and is one finding, not several.
-    _reportDeepLiningAtoms(atoms, deep)
-
-    if options.residues_file_name is not None:
-        output_file = '{0}_Residues_All_{1}.txt'.format(
-            options.residues_file_name, plurals[object_type])
-
-        with open(output_file, "a") as f_res:
-            for k in selected_residues_ch:
-                f_res.write(("{0}_{1}\n".format(options.residues_file_name, k)))
-
-        LOGGER.info("{0} residues were saved to: {1}".format(
-            object_type.capitalize(), output_file))
-
-    return selected_residues_ch
 
 def getObjectLiningInfoMultipleFrames(atoms, objects_all, trajectory=None, object_type='channel',callbacks={'Residues':_getLiningResidues}, **kwargs):
     '''Provides the resnames and resid of residues that are forming the object(s) in
@@ -5396,140 +5323,11 @@ def getObjectLiningInfoMultipleFrames(atoms, objects_all, trajectory=None, objec
 
     return info_all
 
-def getObjectResidueNamesMultipleFrames(atoms, objects_all, trajectory=None, object_type='channel', **kwargs):
-    '''Provides the resnames and resid of residues that are forming the object(s) in
-    multiple frames/models. 
-    Residues are extracted based on distA, the clearance between the surface of
-    the FIL atoms (object atoms) and the van der Waals surface of the residue's
-    own atoms.
-    Results could be save as txt file by providing the `residues_file_name` parameter.
-    
-    :arg atoms: an Atomic object from which residues are selected 
-    :type atoms: :class:`.Atomic`
 
-    :arg objects_all: A list of objects. Each object has a method 
-        `getSplines()` that returns the centerline spline and radius spline of 
-        the object.
-    :type objects_all: list
-    
-    :arg trajectory: optional trajectory object. If provided, coordinates are
-        taken from trajectory frames. If None, a multi-model PDB is assumed and
-        models are selected using ``setACSIndex``.
-    :type trajectory: :class:`.Trajectory` or None
-
-    :arg object_type: Type of the object; "channel", "pore" or "link".
-        Default is "channel".
-    :type object_type: str
-
-    :arg distA: Residues reaching within this distance of the object's surface
-        are reported. It is a clearance between surfaces: the local probe radius
-        and the atom's van der Waals radius are both taken off, so a touching
-        atom sits at 0 and the reach is the same in a wide part of the object as
-        in a narrow one, and the same at a hydrogen as at a potassium ion.
-        Default is 1.5 [Ang]
-    :type distA: int, float
-    
-    :arg residues_file_name: The file with residues will be saved in a text 
-        file with the provided name. Use one word which will be added to 
-        '_Residues_All_{object_type}.txt' sufix. If further analysis will be 
-        performed with selectChannelBySelection() function, the preferable 
-        residues_file_name is PDB+chain for example: '1bbhA'.
-    :type residues_file_name: str  
-    
-    :arg one_letter_aa: Whether to apply 1-latter code to residue name
-        by defult is False. Only amino acids and nucleotides are translated;
-        ligands, cofactors and ions keep their residue name, so that the ion K
-        stays K rather than being read as a lysine.
-    :type one_letter_aa: bool
-
-    :arg include_water: Whether to list water molecules among the lining
-        residues. They are reported one entry per molecule, so a solvated
-        structure gives hundreds of them. Default is False.
-    :type include_water: bool
-
-    :arg include_chain: Whether to append the chain identifier to each residue,
-        as ``ASP108:A``. Default is True: without it a residue number does not
-        identify a residue, since an oligomer lines a channel with residues of
-        the same number from several chains. Pass False for the plain
-        ``ASP108`` labels written by earlier versions.
-    :type include_chain: bool  '''
-
-    start_frame = kwargs.pop('start_frame', 0)
-    stop_frame = kwargs.pop('stop_frame', -1)
-    residues_file_name = kwargs.pop('residues_file_name', None)
-    selected_residues_all = []
-
-    if object_type not in ('channel', 'pore', 'link'):
-        raise ValueError("object_type must be 'channel', 'pore' or 'link'")
-
-    if trajectory is None:
-        # multi-model PDB. objects_all is already one entry per analysed frame,
-        # numbered from start_frame, so the bounds are taken over the labels
-        # rather than over the list.
-        first, last = _frameBounds(start_frame + len(objects_all),
-                                   start_frame, stop_frame)
-        for model_index in range(first, last):
-            objects = objects_all[model_index - first]
-
-            LOGGER.info("Model: {0}".format(model_index))
-            atoms.setACSIndex(model_index)
-
-            if residues_file_name is not None:
-                frame_residues_file_name = residues_file_name + "_model{}".format(model_index)
-            else:
-                frame_residues_file_name = None
-            
-            # Straight to the general form: the per-type wrappers do nothing but
-            # pass object_type on, and branching over them here meant every new
-            # type had to be added in three places.
-            residues = getObjectResidueNames(atoms, objects,
-                                    object_type=object_type,
-                                    residues_file_name=frame_residues_file_name, **kwargs)
-
-            selected_residues_all.append(residues)
-
-    else:
-        # trajectory / DCD
-        nfi = getattr(trajectory, '_nfi', None)
-
-        if hasattr(trajectory, 'reset'):
-            trajectory.reset()
-
-        first, last = _frameBounds(None, start_frame, stop_frame)
-        traj = trajectory[first:last]
-
-        atoms_copy = atoms.copy()
-        for frame_pos, frame in enumerate(traj):
-            frame_index = first + frame_pos
-
-            if frame_pos >= len(objects_all):
-                break
-
-            LOGGER.info("Frame: {0}".format(frame_index))
-            atoms_copy.setCoords(frame.getCoords())
-
-            if residues_file_name is not None:
-                frame_residues_file_name = residues_file_name + "_frame{}".format(frame_index)
-            else:
-                frame_residues_file_name = None
-
-            residues = getObjectResidueNames(atoms_copy, objects_all[frame_pos],
-                                    object_type=object_type,
-                                    residues_file_name=frame_residues_file_name, **kwargs)
-
-            selected_residues_all.append(residues)
-
-        if nfi is not None:
-            trajectory._nfi = nfi
-
-    return selected_residues_all
-
-
-def getChannelResidueNames(atoms, channels, **kwargs):
+def getChannelLiningInfo(atoms, channels, callbacks={'Residues':_getLiningResidues}, **kwargs):
     '''Provides the resnames and resid of residues that are forming the channel(s). 
-    Residues are extracted based on distA, the clearance between the surface of
-    the FIL atoms (channel atoms) and the van der Waals surface of the residue's
-    own atoms.
+    Residues are extracted based on distA which is the distance between FIL atoms 
+    (channel atoms) and protein residues.
     Results could be save as txt file by providing the `residues_file_name` parameter.
     
     :arg atoms: an Atomic object from which residues are selected 
@@ -5541,11 +5339,10 @@ def getChannelResidueNames(atoms, channels, **kwargs):
     :type channels: list
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. It is a clearance between surfaces: the local probe radius
-        and the atom's van der Waals radius are both taken off, so a touching
-        atom sits at 0 and the reach is the same in a wide part of the object as
-        in a narrow one, and the same at a hydrogen as at a potassium ion.
-        Default is 1.5 [Ang]
+        are reported. The local probe radius is added to it, so the reach past
+        the surface is the same in a wide part of the object as in a narrow one.
+        The distance runs to the atom centre, so a touching atom sits at about
+        one van der Waals radius. Default is 2.5 [Ang]
     :type distA: int, float
     
     :arg residues_file_name: The file with residues will be saved in a text 
@@ -5573,14 +5370,13 @@ def getChannelResidueNames(atoms, channels, **kwargs):
         ``ASP108`` labels written by earlier versions.
     :type include_chain: bool  '''
 
-    return getObjectResidueNames(atoms, channels, object_type='channel', **kwargs)
+    return getObjectLiningInfo(atoms, channels, object_type='channel',callbacks=callbacks, **kwargs)
 
 
-def getPoreResidueNames(atoms, pores, **kwargs):
+def getPoreLiningInfo(atoms, pores, callbacks={'Residues':_getLiningResidues}, **kwargs):
     '''Provides the resnames and resid of residues that are forming the pore(s). 
-    Residues are extracted based on distA, the clearance between the surface of
-    the FIL atoms (pore atoms) and the van der Waals surface of the residue's own
-    atoms.
+    Residues are extracted based on distA which is the distance between FIL atoms 
+    (pore atoms) and protein residues.
     Results could be save as txt file by providing the `residues_file_name` parameter.
     
     :arg atoms: an Atomic object from which residues are selected 
@@ -5592,11 +5388,10 @@ def getPoreResidueNames(atoms, pores, **kwargs):
     :type pores: list
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. It is a clearance between surfaces: the local probe radius
-        and the atom's van der Waals radius are both taken off, so a touching
-        atom sits at 0 and the reach is the same in a wide part of the object as
-        in a narrow one, and the same at a hydrogen as at a potassium ion.
-        Default is 1.5 [Ang]
+        are reported. The local probe radius is added to it, so the reach past
+        the surface is the same in a wide part of the object as in a narrow one.
+        The distance runs to the atom centre, so a touching atom sits at about
+        one van der Waals radius. Default is 2.5 [Ang]
     :type distA: int, float
     
     :arg residues_file_name: The file with residues will be saved in a text 
@@ -5624,15 +5419,14 @@ def getPoreResidueNames(atoms, pores, **kwargs):
         ``ASP108`` labels written by earlier versions.
     :type include_chain: bool  '''
 
-    return getObjectResidueNames(atoms, pores, object_type='pore', **kwargs)
+    return getObjectLiningInfo(atoms, pores, object_type='pore', callbacks=callbacks, **kwargs)
 
 
-def getLinkResidueNames(atoms, links, **kwargs):
+def getLinkLiningInfo(atoms, links, callbacks={'Residues':_getLiningResidues}, **kwargs):
     '''Provides the resnames and resid of residues that are forming the chamber
     link(s) returned in ``details['links']`` by :func:`calcChannels`.
-    Residues are extracted based on distA, the clearance between the surface of
-    the FIL atoms (link atoms) and the van der Waals surface of the residue's own
-    atoms. A link runs from one chamber into a
+    Residues are extracted based on distA which is the distance between FIL atoms
+    (link atoms) and protein residues. A link runs from one chamber into a
     shallower one and is cut where it joins it, so the residues reported are
     those lining the neck between the two sites, not a whole route to the solvent.
     Results could be save as txt file by providing the `residues_file_name` parameter.
@@ -5645,11 +5439,10 @@ def getLinkResidueNames(atoms, links, **kwargs):
     :type links: list
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. It is a clearance between surfaces: the local probe radius
-        and the atom's van der Waals radius are both taken off, so a touching
-        atom sits at 0 and the reach is the same in a wide part of the object as
-        in a narrow one, and the same at a hydrogen as at a potassium ion.
-        Default is 1.5 [Ang]
+        are reported. The local probe radius is added to it, so the reach past
+        the surface is the same in a wide part of the object as in a narrow one.
+        The distance runs to the atom centre, so a touching atom sits at about
+        one van der Waals radius. Default is 2.5 [Ang]
     :type distA: int, float
 
     :arg residues_file_name: The file with residues will be saved in a text
@@ -5675,14 +5468,13 @@ def getLinkResidueNames(atoms, links, **kwargs):
         ``ASP108`` labels written by earlier versions.
     :type include_chain: bool  '''
 
-    return getObjectResidueNames(atoms, links, object_type='link', **kwargs)
+    return getObjectLiningInfo(atoms, links, object_type='link', callbacks=callbacks, **kwargs)
 
 
-def getChannelResidueNamesMultipleFrames(atoms, channels, trajectory=None, **kwargs):
+def getChannelLiningInfoMultipleFrames(atoms, channels, trajectory=None, callbacks={'Residues':_getLiningResidues}, **kwargs):
     '''Provides the resnames and resid of residues that are forming the channel(s). 
-    Residues are extracted based on distA, the clearance between the surface of
-    the FIL atoms (channel atoms) and the van der Waals surface of the residue's
-    own atoms.
+    Residues are extracted based on distA which is the distance between FIL atoms 
+    (channel atoms) and protein residues.
     Results could be save as txt file by providing the `residues_file_name` parameter.
     
     :arg atoms: an Atomic object from which residues are selected 
@@ -5694,11 +5486,10 @@ def getChannelResidueNamesMultipleFrames(atoms, channels, trajectory=None, **kwa
     :type channels: list
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. It is a clearance between surfaces: the local probe radius
-        and the atom's van der Waals radius are both taken off, so a touching
-        atom sits at 0 and the reach is the same in a wide part of the object as
-        in a narrow one, and the same at a hydrogen as at a potassium ion.
-        Default is 1.5 [Ang]
+        are reported. The local probe radius is added to it, so the reach past
+        the surface is the same in a wide part of the object as in a narrow one.
+        The distance runs to the atom centre, so a touching atom sits at about
+        one van der Waals radius. Default is 2.5 [Ang]
     :type distA: int, float
     
     :arg residues_file_name: The file with residues will be saved in a text 
@@ -5726,15 +5517,14 @@ def getChannelResidueNamesMultipleFrames(atoms, channels, trajectory=None, **kwa
         ``ASP108`` labels written by earlier versions.
     :type include_chain: bool  '''
 
-    return getObjectResidueNamesMultipleFrames(atoms, channels, trajectory=trajectory, 
-                                                object_type='channel', **kwargs)
+    return getObjectLiningInfoMultipleFrames(atoms, channels, trajectory=trajectory, 
+                                                object_type='channel', callbacks=callbacks, **kwargs)
 
 
-def getPoreResidueNamesMultipleFrames(atoms, pores, trajectory=None, **kwargs):
+def getPoreLiningInfoMultipleFrames(atoms, pores, trajectory=None, callbacks={'Residues':_getLiningResidues}, **kwargs):
     '''Provides the resnames and resid of residues that are forming the pore(s). 
-    Residues are extracted based on distA, the clearance between the surface of
-    the FIL atoms (pore atoms) and the van der Waals surface of the residue's own
-    atoms.
+    Residues are extracted based on distA which is the distance between FIL atoms 
+    (pore atoms) and protein residues.
     Results could be save as txt file by providing the `residues_file_name` parameter.
     
     :arg atoms: an Atomic object from which residues are selected 
@@ -5746,11 +5536,10 @@ def getPoreResidueNamesMultipleFrames(atoms, pores, trajectory=None, **kwargs):
     :type pores: list
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. It is a clearance between surfaces: the local probe radius
-        and the atom's van der Waals radius are both taken off, so a touching
-        atom sits at 0 and the reach is the same in a wide part of the object as
-        in a narrow one, and the same at a hydrogen as at a potassium ion.
-        Default is 1.5 [Ang]
+        are reported. The local probe radius is added to it, so the reach past
+        the surface is the same in a wide part of the object as in a narrow one.
+        The distance runs to the atom centre, so a touching atom sits at about
+        one van der Waals radius. Default is 2.5 [Ang]
     :type distA: int, float
     
     :arg residues_file_name: The file with residues will be saved in a text 
@@ -5778,11 +5567,11 @@ def getPoreResidueNamesMultipleFrames(atoms, pores, trajectory=None, **kwargs):
         ``ASP108`` labels written by earlier versions.
     :type include_chain: bool  '''
 
-    return getObjectResidueNamesMultipleFrames(atoms, pores, trajectory=trajectory,
-                                                    object_type='pore', **kwargs)
+    return getObjectLiningInfoMultipleFrames(atoms, pores, trajectory=trajectory,
+                                                    object_type='pore', callbacks=callbacks, **kwargs)
 
 
-def getLinkResidueNamesMultipleFrames(atoms, links, trajectory=None, **kwargs):
+def getLinkLiningInfoMultipleFrames(atoms, links, trajectory=None, callbacks={'Residues':_getLiningResidues}, **kwargs):
     '''Provides the resnames and resid of residues that are forming the chamber
     link(s) in multiple frames/models.
 
@@ -5803,11 +5592,10 @@ def getLinkResidueNamesMultipleFrames(atoms, links, trajectory=None, **kwargs):
     :type trajectory: :class:`.Atomic`, :class:`.Ensemble`, or trajectory-like object
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. It is a clearance between surfaces: the local probe radius
-        and the atom's van der Waals radius are both taken off, so a touching
-        atom sits at 0 and the reach is the same in a wide part of the object as
-        in a narrow one, and the same at a hydrogen as at a potassium ion.
-        Default is 1.5 [Ang]
+        are reported. The local probe radius is added to it, so the reach past
+        the surface is the same in a wide part of the object as in a narrow one.
+        The distance runs to the atom centre, so a touching atom sits at about
+        one van der Waals radius. Default is 2.5 [Ang]
     :type distA: int, float
 
     :arg residues_file_name: The file with residues will be saved in a text
@@ -5833,8 +5621,8 @@ def getLinkResidueNamesMultipleFrames(atoms, links, trajectory=None, **kwargs):
         ``ASP108`` labels written by earlier versions.
     :type include_chain: bool  '''
 
-    return getObjectResidueNamesMultipleFrames(atoms, links, trajectory=trajectory,
-                                               object_type='link', **kwargs)
+    return getObjectLiningInfoMultipleFrames(atoms, links, trajectory=trajectory,
+                                               object_type='link', callbacks=callbacks, **kwargs)
 
 
 def getSurfaceCavityResidueNames(atoms, cavities, surface, **kwargs):
@@ -5993,12 +5781,12 @@ def getSurfaceCavityResidueNamesMultipleFrames(atoms, cavities_all,
         ``_frameX`` added to the file name.
     :type residues_file_name: str
 
-    :arg distA: Residues reaching within this distance of the cavity's surface
-        are reported. It is a clearance between surfaces: the inscribed radius at
-        each cavity vertex and the atom's van der Waals radius are both taken
-        off, so a touching atom sits at 0 and the reach is the same in a wide
-        cavity as in a narrow one, and the same at a hydrogen as at a potassium
-        ion. Default is 1.5 Å.
+    :arg distA: Residues reaching within this distance of the object's surface
+        are reported. It is a clearance between surfaces: the local probe radius
+        and the atom's van der Waals radius are both taken off, so a touching
+        atom sits at 0 and the reach is the same in a wide part of the object as
+        in a narrow one, and the same at a hydrogen as at a potassium ion.
+        Default is 1.5 [Ang]
     :type distA: int, float
 
     :arg one_letter_aa: whether to apply one-letter code to residue names.
@@ -6963,9 +6751,9 @@ def calcFrequentObjectResidues(residues_all, count_residue_names=False,
     """Count residues lining channels, pores, or surface cavities by chain.
 
     This function analyzes the output returned by:
-    - getChannelResidueNamesMultipleFrames()
-    - getPoreResidueNamesMultipleFrames()
-    - getSurfaceCavityResidueNamesMultipleFrames()
+    - getChannelLiningInfoMultipleFrames()
+    - getPoreLiningInfoMultipleFrames()
+    - getSurfaceCavityLiningInfoMultipleFrames()
 
     :arg residues_all: Residue lists returned by one of the multiple-frame
         residue-reporting functions. The expected input is a list of frame/model
@@ -6989,7 +6777,7 @@ def calcFrequentObjectResidues(residues_all, count_residue_names=False,
     :type output_file_name: str or None
 
     Examples:
-    residues_all = getChannelResidueNamesMultipleFrames(protein, channels_all, trajectory=dcd)
+    residues_all = getChannelLiningInfoMultipleFrames(protein, channels_all, trajectory=dcd)
 
     counts = countObjectResiduesByChain(residues_all)
 
@@ -7140,7 +6928,6 @@ def showFrequentObjectResidues(counts_by_chain, top=50):
         
     return axes[0] if len(axes) == 1 else axes
 
-
 # The dictionary the written file declares conformance to, quoted from the schema's
 # own README so that a reader can check the file against the same document we wrote
 # it from. https://github.com/sb-ncbr/tunnels-schema
@@ -7154,7 +6941,6 @@ _CIF_DICT_LOCATION = \
 # "Pore, Path, etc." - so these are MOLE's words for the same three things, chosen
 # because a file nobody else's reader recognises is not worth the format.
 _CIF_OBJECT_TYPES = {'channel': 'Tunnel', 'pore': 'Pore', 'link': 'Path'}
-
 
 def _cifValue(value, precision=3):
     """One data item, formatted for a CIF loop.
@@ -8098,6 +7884,7 @@ def _writeCifCategories(out, rows, notes=()):
     out.write('#\n')
 
 
+
 class Channel:
     def __init__(self, tetrahedra, centerline_spline, radius_spline, length, 
                  bottleneck, volume, centers, radii, gates, cost=None):
@@ -8225,6 +8012,7 @@ class Cavity:
     def setExitTetrahedra(self, exit_tetrahedra):
         self.exit_tetrahedra = exit_tetrahedra
         
+        
     def setStartingTetrahedron(self, tetrahedron):
         self.starting_tetrahedron = tetrahedron
         
@@ -8263,7 +8051,6 @@ class ChannelCalculator:
     # measurement - see saveCavitiesToPdb for why a cavity cannot be drawn at its
     # true width.
     CAVITY_MARKER_RADIUS = 1.00
-
     def __init__(self, atoms, inner_radius=1.2, sparsity=6,
                  edge_cost='integral'):
         # Only the parameters the class actually consults are held here. surf_radius,
@@ -10062,7 +9849,7 @@ class ChannelCalculator:
             path.append(node)
         path.reverse()
         return path
-
+      
     def _addDedupedLinks(self, cavity, candidates, divergence, openings=None):
         """Keep one link per (chamber joined, corridor taken), cheapest first.
 
@@ -10111,6 +9898,7 @@ class ChannelCalculator:
             if not duplicate:
                 kept.append((points_on_route, clear_on_route, joined))
                 cavity.addLink(link)
+
 
     def _routeDivergence(self, a, b, ra, rb):
         """How far two routes part company, per Angstrom of corridor they share.
@@ -10202,7 +9990,7 @@ class ChannelCalculator:
         if span <= 0:
             return float('inf')
         return float((np.maximum(gap, 0.0) * weight).sum() / span)
-
+    
     def calculateMaxRadius(self, vertice, points, vdw_radii, simp):
         atom_positions = points[simp]
         radii = vdw_radii[simp]
@@ -10799,6 +10587,7 @@ class ChannelCalculator:
 
         return report(best, len(reachable), len(eligible), floor)
 
+
     def setStartingTetrahedraFromPoint(self, cavities, vertices, start_point,
                                        points, vdw_radii, simp, neighbors,
                                        search_radius=5.0, min_depth=5.0):
@@ -11110,6 +10899,7 @@ class ChannelCalculator:
                         float(search_radius)))
 
 
+
     def trimCavitiesByDepth(self, cavities, max_depth):
         """Filtering cavities by max_depth."""
     
@@ -11117,7 +10907,6 @@ class ChannelCalculator:
             cavity.tetrahedra = np.array([
                 tetra for tetra in cavity.tetrahedra
                 if cavity.tetrahedra_depths.get(tetra, np.inf) <= max_depth])
-
 
 #: Source of the PyMOL viewer that :func:`_writeVisScript` leaves beside the
 #: PQR output. Held inline so that this module carries everything it writes,
@@ -11474,7 +11263,6 @@ else:
     cmd.zoom()
     print("Success: Files loaded in perfect sequential order with custom radii!")
 '''
-
 #: Source of the multi-state PyMOL viewer for trajectory/ensemble runs,
 #: left beside a directory of per-frame subdirectories the same way
 #: _VIS_CHANNELS_SCRIPT is left beside a single frame's output.
