@@ -11,16 +11,15 @@ __email__ = ['karolamik@fizyka.umk.pl']
 import logging
 from collections import namedtuple
 from contextlib import contextmanager
-
+from collections import defaultdict
 import numpy as np
-
 from prody import LOGGER, PY3K
 from prody.atomic import Atomic
 from prody.utilities import getCoords, isListLike
 from prody.proteins import writePDB, parsePDB, parsePQR
 from prody.ensemble import Ensemble
 from prody.trajectory import Trajectory
-from prody.measure import calcCenter, calcTransformation, calcDistance, calcRMSD, superpose
+from prody.measure import calcCenter
 
 if not hasattr(np, "trapz"):
     np.trapz = np.trapezoid
@@ -28,7 +27,7 @@ if not hasattr(np, "trapz"):
 __all__ = ['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames', 
            'getChannelParameters', 'getChannelAtoms', 'showChannels', 
            'showCavities', 'showSurfaceCavities', 'selectChannelBySelection', 
-           'getChannelLiningInfo',
+           'getChannelResidueNames',
            'calcChannelSurfaceOverlaps', 'calcSurfaceCavities', 
            'calcSurfaceCavitiesMultipleFrames', 'getSurfaceCavityParameters',
            'getSurfaceCavityResidueNames', 'selectSurfaceCavityBySelection',
@@ -36,32 +35,20 @@ __all__ = ['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames',
            'getSurfaceCavityResidueNamesMultipleFrames',
            'getSurfaceCavityParametersMultipleFrames', 
            'getChannelParametersMultipleFrames', '_reportAtomsInputComposition',
-           'getChannelLiningInfoMultipleFrames', 'calcPoresFromChannels',
-           'showPores', 'getPoreParameters', 'getPoreLiningInfo', 
+           'getChannelResidueNamesMultipleFrames', 'calcPoresFromChannels',
+           'showPores', 'getPoreParameters', 'getPoreResidueNames',
            'calcPoresFromChannelsMultipleFrames', 'getPoreParametersMultipleFrames',
-           'getPoreLiningInfoMultipleFrames', 'scanChannelParameters',
-           'getLinkParameters', 'getLinkLiningInfo',
-           'getLinkParametersMultipleFrames', 'getLinkLiningInfoMultipleFrames',
+           'getPoreResidueNamesMultipleFrames', 'scanChannelParameters',
+           'getLinkParameters', 'getLinkResidueNames',
+           'getLinkParametersMultipleFrames', 'getLinkResidueNamesMultipleFrames',
            'scanSurfaceCavityParameters',
            'calcFrequentObjectResidues', 'showFrequentObjectResidues',
            'connectChannelsToSurfaceCavities',
            'calcFrequentObjectResidues', 'showFrequentObjectResidues',
-           'writeChannelsCIF']
+           'writeChannelsCIF',
+           'buildLiningSequenceDistanceMatrix', 'buildCenterlineDistanceMatrix',
+           'buildVoxelOverlapDistanceMatrix']
 
-# Sampling of the enclosure test used to strip the moat (see
-# ChannelCalculator.calcEnclosure). These are constants, not knobs: the enclosure
-# of a point depends on how many directions are sampled and how far they are
-# followed, so min_enclosure is only meaningful against a fixed sampling. Adding
-# rays lowers every enclosure, since more directions find more of the thin ways
-# out of a channel, and so invalidates the threshold rather than refining it.
-ENCLOSURE_RAYS = 32
-ENCLOSURE_RANGE = 25.0
-ENCLOSURE_STEP = 0.75
-# One radius for every atom, on the scale of a heavy-atom vdW radius. Enclosure is
-# a burial heuristic, so resolving 1.52 A from 1.7 A would only shift every value
-# by a little and be absorbed by min_enclosure; a single radius means a single
-# tree and a plain nearest-neighbour test.
-ENCLOSURE_RADIUS = 1.7
 
 # Van der Waals radii in Angstrom, by element symbol (upper case). The radii the
 # tessellation is built on, and the ones the lining report measures a Voronoi
@@ -210,7 +197,6 @@ _CHARGED_RESIDUES = {'ARG': 1, 'LYS': 1, 'HIS': 1, 'ASP': -1, 'GLU': -1}
 _IONIZABLE_RESIDUES = frozenset(['ASP', 'GLU', 'HIS', 'CYS', 'TYR', 'LYS',
                                  'ARG'])
 
-
 _OVERLAP_OFFSET_CACHE = {}
 
 # The tag a per-object file carries in its name, against the word the same
@@ -220,7 +206,6 @@ _OVERLAP_OFFSET_CACHE = {}
 # _channel0.pqr to _chl0.pqr.
 _OBJECT_TAGS = {'chl': 'channel', 'lnk': 'link', 'pore': 'pore',
                 'cavity': 'cavity'}
-
 
 @contextmanager
 def _warningsDelivered():
@@ -331,6 +316,7 @@ def _numberedPath(filename, tag, index, suffix='', stem=None):
         stem = path.stem
     return path.with_name("{0}{1}{2}{3}{4}".format(
         stem + '_' if stem else '', tag, index, suffix, path.suffix))
+
 
 def _frameBounds(n_frames, start_frame=0, stop_frame=-1):
     """Half-open ``[first, last)`` over the 0-based frames a run covers.
@@ -540,7 +526,7 @@ def _surfaceFromPqrWorker(args):
         surface.update(map(tuple, voxels))
 
     return surface
-    
+
 
 def _calcChannelsMultipleFramesWorker(args):
     """Compute channels. Supporting function for muliprocessing in :func:`calcChannelsMultipleFrames`."""
@@ -568,7 +554,8 @@ def _calcChannelsMultipleFramesWorker(args):
             if return_details:
                 return frame_nr, [], [], {}
             return frame_nr,[],[]
-    except:
+    except Exception as e:
+        print("Frame {0} failed: {1}".format(frame_nr, e))
         if return_details:
             return frame_nr, [], [], {}
         return frame_nr, [], []
@@ -1012,6 +999,7 @@ def getVmdModel(vmd_path, atoms, representation='NewCartoon'):
     If problem with `ipykernel.comm.Comm` class appeared while using getVmdModel
     please update dash: python -m pip install -U dash
 
+
     :arg vmd_path: Path to the VMD executable. This is required to run VMD and 
         execute the TCL script.
     :type vmd_path: str
@@ -1140,7 +1128,7 @@ def getVmdModel(vmd_path, atoms, representation='NewCartoon'):
             os.unlink(output_path)
 
         LOGGER.info("Model created successfully.")
-        return stl_mesh
+    return stl_mesh
 
 
 def showChannels(channels, model=None, surface=None):
@@ -1157,12 +1145,13 @@ def showChannels(channels, model=None, surface=None):
     conda install open3d (for Anaconda users; version open3d-0.19.0 was used 
     during the development) or pip install open3d
     
-    :arg channels: A list of channel objects or a single channel object. Each 
-        channel should have a `getSplines()` method that returns two 
-        CubicSpline objects: one for the centerline and one for the radii.
+:arg channels: A list of channel objects or a single channel object. Each
+        channel should have a `getSplines()` method that returns two
+        interpolators over one parameter domain: one for the centerline and one
+        for the radii.
     :type channels: list or single channel object
     
-    :arg model: An optional Open3D TriangleMesh object representing the 
+    :arg model: An optional Open3D TriangleMesh object representing the
         molecular model, such as a protein. If provided, this model will be 
         rendered in the visualization.
         Model can be generated using getVmdModel() function.
@@ -3413,10 +3402,10 @@ def calcChannelsMultipleAtomGroups(atomgroups, output_path=None,
         return channels_all, surfaces_all
     
     max_proc = kwargs.pop('max_proc',None)
-    chunksize = max(1, len(atomgroups)//(max_proc*4))
+    
     if max_proc is None:
         max_proc = max(1, cpu_count()//2)
-    
+    chunksize = max(1, len(atomgroups)//(max_proc*4))
     if max_proc == 1:
         results = [_calcChannelsMultipleFramesWorker(task)
                     for task in tasks]
@@ -3427,9 +3416,10 @@ def calcChannelsMultipleAtomGroups(atomgroups, output_path=None,
             ctx = multiprocessing.get_context(mp_context)
         
         with ctx.Pool(processes=max_proc) as pool:
-            results = pool.map(_calcChannelsMultipleFramesWorker, tasks,chunksize=chunksize )
+            results_unordered = pool.imap_unordered(_calcChannelsMultipleFramesWorker, tasks,chunksize=chunksize )
+            results = [result for result in results_unordered]
+            results.sort(key=lambda x: x[0])
 
-    results.sort(key=lambda x: x[0])
     failed_idx = []
     for result in results:
         if return_details:
@@ -3483,11 +3473,13 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         Default is False.
     :type separate: bool
 
-    :arg start_point: Optional starting point for channel search. If provided, 
-        the algorithm will use the tetrahedron whose Voronoi vertex is closest 
-        to this point as the starting tetrahedron (overriding the default automatic 
-        seed selection based on the deepest tetrahedron). Coordinates must be given in Å.
-    :type start_point: list, tuple, or ndarray (length 3), or None 
+    :arg start_point: Optional starting point for channel search, applied to every
+        frame. If provided, the search is restricted to the cavity holding the
+        tetrahedron nearest the point and is seeded there, overriding the default
+        automatic seed selection; see :func:`calcChannels` for how the seed is
+        picked and for ``start_point_search``, which bounds how far from the point
+        it may lie. Coordinates must be given in Å.
+    :type start_point: list, tuple, or ndarray (length 3), or None
 
     :arg max_proc: Maximum number of parallel processes used for calculation. 
         If 1, files are processed serially. If None, all available CPU
@@ -3516,8 +3508,9 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
 
     Example usage:
     channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
-                                    output_path="channels.pdb", separate=False, surf_radius=3, 
-                                    inner_radius=0.9, min_depth=5, bottleneck=1, sparsity=3)
+                                    output_path="channels.pdb", separate=False, 
+                                    surf_radius=15, 
+                                    inner_radius=1.2, min_depth=5, bottleneck=1, sparsity=6)
                                   
     channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
                                     output_path="channels.pdb", separate=False, 
@@ -3546,49 +3539,65 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
     return_details = kwargs.pop('return_details', False)
     start_frame = kwargs.pop('start_frame', 0)
     stop_frame = kwargs.pop('stop_frame', -1)
-    
+    # Read rather than popped: the worker forwards the rest of kwargs to
+    # calcChannels, which is where the format takes effect. It is wanted here only
+    # to name the per-frame files. The schema describes one structure and has no
+    # frame of its own, so a frame per file is what keeps each written file
+    # something the schema can describe - the same arrangement the PQR path uses.
+    frame_suffix = '.cif' if _isMmcifFormat(
+        kwargs.get('output_format', 'pqr'), separate) else '.pqr'
     if output_path:
         output_path = Path(output_path)
-        if output_path.suffix == ".pqr":
+        if output_path.suffix in ('.pqr', '.cif'):
             output_path = output_path.with_suffix('')
 
     if trajectory is not None:
-        if not isinstance(trajectory, Trajectory) and not isinstance(trajectory, Ensemble):
-            raise ValueError("trajectory must be a Trajectory or Ensemble object.")
+        if isinstance(trajectory, Atomic):
+            trajectory = Ensemble(trajectory)
 
-        if stop_frame == -1:
-            traj = trajectory[start_frame:]
-        else:
-            traj = trajectory[start_frame:stop_frame+1]
-        
-        
-        for j0, frame0 in enumerate(traj, start=start_frame):
+        # `_nfi` is a DCD read cursor, so only a file-backed trajectory has one;
+        # an Ensemble holds its coordinates in memory and has nothing to rewind.
+        # Reading it unguarded made every in-memory input raise, the conversion
+        # just above included - the one branch written to accept an Atomic turned
+        # it into the very type that could not survive the next line.
+        nfi = getattr(trajectory, '_nfi', None)
+        if hasattr(trajectory, 'reset'):
+            trajectory.reset()
+
+        first, last = _frameBounds(None, start_frame, stop_frame)
+        traj = trajectory[first:last]
+
+        atoms_copy = atoms.copy()
+        for j0, frame0 in enumerate(traj, start=first):
             if output_path:
-                frame_output_path = _frameOutputPath(output_path, j0, "channels")
+                frame_output_path = _frameOutputPath(output_path, j0, "channels",
+                                                     frame_suffix)
             else:
                 frame_output_path = None
-            atoms_copy = atoms.copy()
+            
             tasks.append((j0, atoms_copy, np.array(frame0.getCoords(), copy=True),
                             frame_output_path, separate, start_point, return_details, kwargs))
+        if nfi is not None:
+            trajectory._nfi = nfi
 
-    elif atoms.numCoordsets() > 1:
-        # if not atoms.numCoordsets() > 1:
-        #     atoms.addCoordset(trajectory.getCoordsets())
-        coordsets = atoms.getCoordsets()
-        for i in range(len(atoms.getCoordsets()[start_frame:stop_frame])):
-            model_nr = i + start_frame
-
-            if output_path:
-                frame_output_path = _frameOutputPath(output_path, model_nr,
-                                                    "channels")
-            else:
-                frame_output_path = None
-            
-            tasks.append((model_nr, atoms, np.array(coordsets[model_nr], copy=True),
-                            frame_output_path, separate, start_point, return_details, kwargs))
-            
     else:
-        LOGGER.info("Include trajectory or use multi-model PDB file.")
+        if atoms.numCoordsets() > 1:
+            coordsets = atoms.getCoordsets()
+            first, last = _frameBounds(len(coordsets), start_frame, stop_frame)
+            for model_nr in range(first, last):
+
+                if output_path:
+                    frame_output_path = _frameOutputPath(output_path, model_nr,
+                                                         "channels",
+                                                         frame_suffix)
+                else:
+                    frame_output_path = None
+                
+                tasks.append((model_nr, atoms, np.array(coordsets[model_nr], copy=True),
+                                frame_output_path, separate, start_point, return_details, kwargs))
+                
+        else:
+            LOGGER.info("Include trajectory or use multi-model PDB file.")
 
     import multiprocessing
 
@@ -3612,9 +3621,9 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
             ctx = multiprocessing.get_context(mp_context)
 
         with ctx.Pool(processes=max_proc) as pool:
-            results = pool.map(_calcChannelsMultipleFramesWorker, tasks,chunksize=chunksize)
-    
-    results.sort(key=lambda x: x[0])
+            results = pool.map(_calcChannelsMultipleFramesWorker, tasks)
+            
+
     for result in results:
         if return_details:
             _, channels, surfaces, details = result
@@ -3630,9 +3639,19 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
             channel._buildSplines()
 
     output_format = kwargs.get('output_format', 'pqr')
-    if output_path is not None and Path(output_path).is_dir() and (output_format == 'mmcif' or separate):
-        channel_pattern = 'channels.cif' if output_format == 'mmcif' else 'chl*.pqr'
-        _writeVisTrajScript(output_path, pattern=channel_pattern)
+    if output_path is not None and Path(output_path).is_dir() and (
+            output_format == 'mmcif' or separate):
+
+        channel_pattern = (
+            'channels.cif'
+            if output_format == 'mmcif'
+            else 'channels*_sp*_chl*.pqr'
+        )
+
+        _writeVisTrajScript(
+            output_path,
+            pattern=channel_pattern
+        )
     elif output_path is not None and not separate and output_format != 'mmcif':
         LOGGER.info("Wrote combined channels.pqr per frame; re-run with "
                     "separate=True for a multi-state PyMOL viewer, which "
@@ -3739,19 +3758,20 @@ def calcSurfaceCavitiesMultipleFrames(atoms, trajectory=None, output_path=None,
             output_path = output_path.with_suffix('')
 
     if trajectory is not None:
-        if isinstance(trajectory,Atomic):
+        if isinstance(trajectory, Atomic):
             trajectory = Ensemble(trajectory)
 
-        nfi = trajectory._nfi
-        trajectory.reset()
-        
-        if stop_frame == -1:
-            traj = trajectory[start_frame:]
-        else:
-            traj = trajectory[start_frame:stop_frame + 1]
+        # As in calcChannelsMultipleFrames: only a file-backed trajectory carries
+        # a read cursor, and an in-memory one has nothing to save or rewind.
+        nfi = getattr(trajectory, '_nfi', None)
+        if hasattr(trajectory, 'reset'):
+            trajectory.reset()
+
+        first, last = _frameBounds(None, start_frame, stop_frame)
+        traj = trajectory[first:last]
 
         atoms_copy = atoms.copy()
-        for j0, frame0 in enumerate(traj, start=start_frame):
+        for j0, frame0 in enumerate(traj, start=first):
             if output_path:
                 frame_output_path = _frameOutputPath(output_path, j0,
                                                      "cavities")
@@ -3761,18 +3781,16 @@ def calcSurfaceCavitiesMultipleFrames(atoms, trajectory=None, output_path=None,
             tasks.append((j0, atoms_copy, np.array(frame0.getCoords(), copy=True),
                           frame_output_path, separate, kwargs))
 
-        trajectory._nfi = nfi
+        if nfi is not None:
+            trajectory._nfi = nfi
 
     else:
         if atoms.numCoordsets() > 1:
             coordsets = atoms.getCoordsets()
 
-            if stop_frame == -1:
-                model_indices = range(start_frame, len(coordsets))
-            else:
-                model_indices = range(start_frame, stop_frame + 1)
+            first, last = _frameBounds(len(coordsets), start_frame, stop_frame)
 
-            for i in model_indices:
+            for i in range(first, last):
                 if output_path:
                     frame_output_path = _frameOutputPath(output_path, i,
                                                          "cavities")
@@ -4144,7 +4162,7 @@ def getChannelParametersMultipleFrames(channels_all, trajectory=None, **kwargs):
 
     :arg trajectory: The trajectory the frames came from, if any. Only its
         presence is used, to name the files ``_frame<i>`` rather than
-         ``_model<i>``, matching :func:`getChannelLiningInfoMultipleFrames`.
+         ``_model<i>``, matching :func:`getChannelResidueNamesMultipleFrames`.
     :type trajectory: :class:`.Atomic`, :class:`.Ensemble`, or trajectory-like object
 
     :arg param_file_name: base name for the output parameter files. If provided,
@@ -4536,9 +4554,9 @@ def _vertexRadiiSource(atoms):
     if dry is None:
         dry = atoms
 
-    vdw = ChannelCalculator.getVdwRadii(
-        np.char.upper(np.asarray(dry.getElements(), dtype=str)))
-    return _kdTree(dry), vdw
+    # Silent: getSurfaceCavityResidueNames has already measured the same atoms
+    # through _liningSource, which said whatever there was to say about them.
+    return _kdTree(dry), _atomRadii(dry, warn=False)
 
 
 def _vertexRadii(points, source, k=24):
@@ -4820,6 +4838,33 @@ def _formatLiningResidues(residues, options):
                                             ':' + chid if chid else ''))
     return labels
 
+def _infoAsListOfStrings(info,key='Residues',sep=", "):
+
+    if not info:
+        return []
+      
+    def _joinList(lst,sep=sep ):
+        if not lst:
+            return ""
+        if len(lst) == 1:
+            return str(lst[0])
+        return sep.join(map(str, lst))
+
+    result = []
+    if isinstance(info,dict):
+        for channel in info:
+            lst = _joinList(info[channel][key])
+            result.append(f"{channel}: {lst}")
+        return result
+    
+    for conf in info:
+        tmp = []
+        for channel in conf:
+            lst = _joinList(conf[channel][key])
+            tmp.append(f"{channel}: {lst}")
+        result.append(tmp)
+    return result
+
 def _liningResindexMask(resindices, tree, points, radii, buffer=2.5):
     from itertools import chain
     if len(points) == 0:
@@ -5081,6 +5126,50 @@ def _getLiningResidues(context):
         labels = np.char.add(labels,np.char.add(':', chains.astype(str)),)
     return np.unique(labels).tolist()
 
+def _getObjectResponseProfile(context):
+    kwargs = context['kwargs']
+    prs_matrix=kwargs.get('prs_matrix')
+    if not isinstance(prs_matrix,np.ndarray):
+        print('PRS Matrix must be provided')
+        return
+    if prs_matrix[0][0] == 1:
+        prs_matrix -= np.eye(len(prs_matrix))
+    mask = context['mask']
+    resindices_sub = context['resindices'][mask]
+    effect = prs_matrix[resindices_sub]
+    sense = prs_matrix.T[resindices_sub]
+    ec = np.mean(effect,axis=0)
+    sc = np.mean(sense,axis=0)
+    return {'Effecting':ec,'Sensing':sc}
+
+def _getSiteScores(context):
+    kwargs = context['kwargs']
+    mask = context['mask']
+    scores = kwargs.get('scores')
+    if isinstance(scores,dict):
+        subscores = {}
+        for key,values in score.items():
+            subscores[key] = values[mask]
+        return subscores
+        subscores = scores[mask]
+    return subscores
+
+def _getSiteScoreStats(context):
+    subscores = _getSiteScores(conext)
+    if isinstance(subscores,dict):
+        for key,values in subscores.items():
+            stats[key] = {'max',value.max,
+                         'med',values.median}
+        return stats
+    stats = {'max':subscores.max,
+            'med':subscores.median}
+    return stats
+
+def _getLiningResIndices(context):
+    mask = context['mask']
+    resindices = context['resindices'][mask]
+    unique_resindices = np.unique(resindices)
+    return unique_resindices
 
 def getObjectLiningInfo(atoms, objects, object_type='channel',
                         callbacks=None, **kwargs):
@@ -5195,6 +5284,194 @@ def getObjectLiningInfo(atoms, objects, object_type='channel',
         LOGGER.info("Lining Info was saved to: {0}".format(output_file))
         
     return info
+
+def getObjectEssentialityScores(atoms, objects,stats_only=True, object_type='channel', **kwargs):
+    # ESSA is only scores protein residues and will not score ligands, nucleotides, waters, ions, or other objects
+    #Might update to account for cofactors,ribozymes, ect.
+    atoms = atoms.protein
+    info={}
+    z_scores = kwargs.pop('z_scores')
+    if not z_scores:
+        enm = kwargs.pop('enm','gnm')
+        n_modes = kwargs.pop('n_modes',10)
+        cutoff = kwargs.pop('cutoff',None)
+        lig = kwagrs.pop('lig', None)
+        lowmem = kwargs.pop('lowmem',False)
+        essa=ESSA()
+        essa.setSystem(atoms,lig=lig)
+        essa.scanResidues(enm=enm,n_modes=n_modes,cutoff=cutoff,lowmem=lowmem)
+        z_scores = essa._zscore
+    if stats_only:
+        info = getObjectLiningInfo(atoms, 
+                            objects,
+                            object_type=object_type,
+                            callbacks={'SiteEssentiality':_getSiteScoreStats},
+                            scores=z_scores,
+                            **kwargs)
+    else:
+        info = getObjectLiningInfo(atoms, 
+                                    objects,
+                                    object_type=object_type,
+                                    callbacks={'SiteEssentiality':_getSiteScores},
+                                    scores=z_scores,
+                                    **kwargs)
+    return info
+
+def getObjectEffectivenessSensitivity(atoms, objects,prs_data = None,stats_only=True, object_type='channel', **kwargs):
+    info={}
+    effectivness = None
+    sensitivity = None
+    if prs_data:
+        prs_matrix,effectiveness,sensitivity = prs_data
+    else:
+        enm = kwargs.pop('enm','anm')
+        n_modes = kwargs.pop('n_modes','all')
+        model, atomsca = calcENM(atoms, select='calpha',model=enm,n_modes=n_modes,trim='trim')
+        prs_matrix,effectiveness,sensitivity = calcPerturbResponse(model, atoms = atomsca)       
+        
+    if stats_only:
+        info = getObjectLiningInfo(atoms, 
+                            objects,
+                            object_type=object_type,
+                            callbacks={'PRScores':_getSiteScoreStats},
+                            scores={'effectiveness':effectiveness,
+                                   'sensitivity':sensitivity},
+                            **kwargs)
+    else:
+        info = getObjectLiningInfo(atoms, 
+                                    objects,
+                                    object_type=object_type,
+                                    callbacks={'PRScores':_getSiteScores},
+                                    scores={'effectiveness':effectiveness,
+                                   'sensitivity':sensitivity},
+                                    **kwargs)
+    return info
+
+
+
+def getObjectResidueNames(atoms, objects, object_type='channel', **kwargs):
+    '''Provides the resnames and resid of residues that are forming the object(s). 
+    Residues are extracted based on distA, the clearance between the surface of
+    the FIL atoms (object atoms) and the van der Waals surface of the residue's
+    own atoms.
+    Results could be save as txt file by providing the `residues_file_name` parameter.
+    
+    :arg atoms: an Atomic object from which residues are selected 
+    :type atoms: :class:`.Atomic`
+
+    :arg objects: A list of objects. Each object has a method 
+        `getSplines()` that returns the centerline spline and radius spline of 
+        the object.
+    :type objects: list
+    
+    :arg object_type: Type of the object; "channel", "pore" or "link".
+        Default is "channel".
+    :type object_type: str
+
+    :arg distA: Residues reaching within this distance of the object's surface
+        are reported. It is a clearance between surfaces: the local probe radius
+        and the atom's van der Waals radius are both taken off, so a touching
+        atom sits at 0 and the reach is the same in a wide part of the object as
+        in a narrow one, and the same at a hydrogen as at a potassium ion.
+        Default is 1.5 [Ang]
+    :type distA: int, float
+    
+    :arg residues_file_name: The file with residues will be saved in a text 
+        file with the provided name. Use one word which will be added to 
+        '_Residues_All_{object_type}.txt' sufix. If further analysis will be 
+        performed with selectChannelBySelection() function, the preferable 
+        residues_file_name is PDB+chain for example: '1bbhA'.
+    :type residues_file_name: str  
+    
+    :arg one_letter_aa: Whether to apply 1-latter code to residue name
+        by defult is False. Only amino acids and nucleotides are translated;
+        ligands, cofactors and ions keep their residue name, so that the ion K
+        stays K rather than being read as a lysine.
+    :type one_letter_aa: bool
+
+    :arg include_water: Whether to list water molecules among the lining
+        residues. They are reported one entry per molecule, so a solvated
+        structure gives hundreds of them. Default is False.
+    :type include_water: bool
+
+    :arg include_chain: Whether to append the chain identifier to each residue,
+        as ``ASP108:A``. Default is True: without it a residue number does not
+        identify a residue, since an oligomer lines a channel with residues of
+        the same number from several chains. Pass False for the plain
+        ``ASP108`` labels written by earlier versions.
+    :type include_chain: bool  '''
+
+
+    info = getObjectLiningInfo(atoms,
+                                objects,
+                                object_type,
+                                callbacks = {'Residues': _getLiningResidues},
+                                **kwargs )
+    
+    resnames = _infoAsListOfStrings(info)
+    return resnames
+
+def getObjectResidueNames(atoms, channels, **kwargs):
+    '''Provides the resnames and resid of residues that are forming the object(s). 
+    Residues are extracted based on distA, the clearance between the surface of
+    the FIL atoms (object atoms) and the van der Waals surface of the residue's
+    own atoms.
+    Results could be save as txt file by providing the `residues_file_name` parameter.
+    
+    :arg atoms: an Atomic object from which residues are selected 
+    :type atoms: :class:`.Atomic`
+
+    :arg objects: A list of objects. Each object has a method 
+        `getSplines()` that returns the centerline spline and radius spline of 
+        the object.
+    :type objects: list
+    
+    :arg object_type: Type of the object; "channel", "pore" or "link".
+        Default is "channel".
+    :type object_type: str
+
+    :arg distA: Residues reaching within this distance of the object's surface
+        are reported. It is a clearance between surfaces: the local probe radius
+        and the atom's van der Waals radius are both taken off, so a touching
+        atom sits at 0 and the reach is the same in a wide part of the object as
+        in a narrow one, and the same at a hydrogen as at a potassium ion.
+        Default is 1.5 [Ang]
+    :type distA: int, float
+    
+    :arg residues_file_name: The file with residues will be saved in a text 
+        file with the provided name. Use one word which will be added to 
+        '_Residues_All_{object_type}.txt' sufix. If further analysis will be 
+        performed with selectChannelBySelection() function, the preferable 
+        residues_file_name is PDB+chain for example: '1bbhA'.
+    :type residues_file_name: str  
+    
+    :arg one_letter_aa: Whether to apply 1-latter code to residue name
+        by defult is False. Only amino acids and nucleotides are translated;
+        ligands, cofactors and ions keep their residue name, so that the ion K
+        stays K rather than being read as a lysine.
+    :type one_letter_aa: bool
+
+    :arg include_water: Whether to list water molecules among the lining
+        residues. They are reported one entry per molecule, so a solvated
+        structure gives hundreds of them. Default is False.
+    :type include_water: bool
+
+    :arg include_chain: Whether to append the chain identifier to each residue,
+        as ``ASP108:A``. Default is True: without it a residue number does not
+        identify a residue, since an oligomer lines a channel with residues of
+        the same number from several chains. Pass False for the plain
+        ``ASP108`` labels written by earlier versions.
+    :type include_chain: bool  '''
+
+
+    info = getObjectLiningInfo(atoms,
+                                channels,
+                                object_type='channel',
+                                callbacks = {'Residues': _getLiningResidues},
+                                **kwargs )
+    
+    resnames = _infoAsListOfStrings(info)
+    return resnames
 
 def getObjectLiningInfoMultipleFrames(atoms, objects_all, trajectory=None, object_type='channel',callbacks={'Residues':_getLiningResidues}, **kwargs):
     '''Provides the resnames and resid of residues that are forming the object(s) in
@@ -5323,57 +5600,7 @@ def getObjectLiningInfoMultipleFrames(atoms, objects_all, trajectory=None, objec
 
     return info_all
 
-
-def getChannelLiningInfo(atoms, channels, callbacks={'Residues':_getLiningResidues}, **kwargs):
-    '''Provides the resnames and resid of residues that are forming the channel(s). 
-    Residues are extracted based on distA which is the distance between FIL atoms 
-    (channel atoms) and protein residues.
-    Results could be save as txt file by providing the `residues_file_name` parameter.
-    
-    :arg atoms: an Atomic object from which residues are selected 
-    :type atoms: :class:`.Atomic`
-
-    :arg channels: A list of channel objects. Each channel has a method 
-        `getSplines()` that returns the centerline spline and radius spline of 
-        the channel.
-    :type channels: list
-
-    :arg distA: Residues reaching within this distance of the object's surface
-        are reported. The local probe radius is added to it, so the reach past
-        the surface is the same in a wide part of the object as in a narrow one.
-        The distance runs to the atom centre, so a touching atom sits at about
-        one van der Waals radius. Default is 2.5 [Ang]
-    :type distA: int, float
-    
-    :arg residues_file_name: The file with residues will be saved in a text 
-        file with the provided name. Use one word which will be added to 
-        '_Residues_All_channels.txt' sufix. If further analysis will be 
-        performed with selectChannelBySelection() function, the preferable 
-        residues_file_name is PDB+chain for example: '1bbhA'.
-    :type residues_file_name: str  
-    
-    :arg one_letter_aa: Whether to apply 1-latter code to residue name
-        by defult is False. Only amino acids and nucleotides are translated;
-        ligands, cofactors and ions keep their residue name, so that the ion K
-        stays K rather than being read as a lysine.
-    :type one_letter_aa: bool
-
-    :arg include_water: Whether to list water molecules among the lining
-        residues. They are reported one entry per molecule, so a solvated
-        structure gives hundreds of them. Default is False.
-    :type include_water: bool
-
-    :arg include_chain: Whether to append the chain identifier to each residue,
-        as ``ASP108:A``. Default is True: without it a residue number does not
-        identify a residue, since an oligomer lines a channel with residues of
-        the same number from several chains. Pass False for the plain
-        ``ASP108`` labels written by earlier versions.
-    :type include_chain: bool  '''
-
-    return getObjectLiningInfo(atoms, channels, object_type='channel',callbacks=callbacks, **kwargs)
-
-
-def getPoreLiningInfo(atoms, pores, callbacks={'Residues':_getLiningResidues}, **kwargs):
+def getChannelResidueNames(atoms, channels, **kwargs):
     '''Provides the resnames and resid of residues that are forming the pore(s). 
     Residues are extracted based on distA which is the distance between FIL atoms 
     (pore atoms) and protein residues.
@@ -5419,10 +5646,70 @@ def getPoreLiningInfo(atoms, pores, callbacks={'Residues':_getLiningResidues}, *
         ``ASP108`` labels written by earlier versions.
     :type include_chain: bool  '''
 
-    return getObjectLiningInfo(atoms, pores, object_type='pore', callbacks=callbacks, **kwargs)
+    info = getObjectLiningInfo(atoms, 
+                                channels, 
+                                object_type='channel',
+                                callbacks={'Residues':_getLiningResidues},
+                                **kwargs)
+    resnames = _infoAsListOfStrings(info)
+    return resnames
+
+def getPoreResidueNames(atoms, pores, **kwargs):
+    '''Provides the resnames and resid of residues that are forming the pore(s). 
+    Residues are extracted based on distA which is the distance between FIL atoms 
+    (pore atoms) and protein residues.
+    Results could be save as txt file by providing the `residues_file_name` parameter.
+    
+    :arg atoms: an Atomic object from which residues are selected 
+    :type atoms: :class:`.Atomic`
+
+    :arg pores: A list of pore objects. Each pore has a method 
+        `getSplines()` that returns the centerline spline and radius spline of 
+        the pore.
+    :type pores: list
+
+    :arg distA: Residues reaching within this distance of the object's surface
+        are reported. The local probe radius is added to it, so the reach past
+        the surface is the same in a wide part of the object as in a narrow one.
+        The distance runs to the atom centre, so a touching atom sits at about
+        one van der Waals radius. Default is 2.5 [Ang]
+    :type distA: int, float
+    
+    :arg residues_file_name: The file with residues will be saved in a text 
+        file with the provided name. Use one word which will be added to 
+        '_Residues_All_pores.txt' sufix. If further analysis will be 
+        performed with selectChannelBySelection() function, the preferable 
+        residues_file_name is PDB+chain for example: '1bbhA'.
+    :type residues_file_name: str  
+    
+    :arg one_letter_aa: Whether to apply 1-latter code to residue name
+        by defult is False. Only amino acids and nucleotides are translated;
+        ligands, cofactors and ions keep their residue name, so that the ion K
+        stays K rather than being read as a lysine.
+    :type one_letter_aa: bool
+
+    :arg include_water: Whether to list water molecules among the lining
+        residues. They are reported one entry per molecule, so a solvated
+        structure gives hundreds of them. Default is False.
+    :type include_water: bool
+
+    :arg include_chain: Whether to append the chain identifier to each residue,
+        as ``ASP108:A``. Default is True: without it a residue number does not
+        identify a residue, since an oligomer lines a channel with residues of
+        the same number from several chains. Pass False for the plain
+        ``ASP108`` labels written by earlier versions.
+    :type include_chain: bool  '''
+
+    info = getObjectLiningInfo(atoms, 
+                                pores, 
+                                object_type='pore',
+                                callbacks={'Residues':_getLiningResidues},
+                                **kwargs)
+    resnames = _infoAsListOfStrings(info)
+    return resnames
 
 
-def getLinkLiningInfo(atoms, links, callbacks={'Residues':_getLiningResidues}, **kwargs):
+def getLinkResidueNames(atoms, links, **kwargs):
     '''Provides the resnames and resid of residues that are forming the chamber
     link(s) returned in ``details['links']`` by :func:`calcChannels`.
     Residues are extracted based on distA which is the distance between FIL atoms
@@ -5438,11 +5725,12 @@ def getLinkLiningInfo(atoms, links, callbacks={'Residues':_getLiningResidues}, *
         that returns the centerline spline and radius spline of the link.
     :type links: list
 
-    :arg distA: Residues reaching within this distance of the object's surface
-        are reported. The local probe radius is added to it, so the reach past
-        the surface is the same in a wide part of the object as in a narrow one.
-        The distance runs to the atom centre, so a touching atom sits at about
-        one van der Waals radius. Default is 2.5 [Ang]
+    :arg distA: Residues reaching within this distance of the cavity's surface
+        are reported. It is a clearance between surfaces: the inscribed radius at
+        each cavity vertex and the atom's van der Waals radius are both taken
+        off, so a touching atom sits at 0 and the reach is the same in a wide
+        cavity as in a narrow one, and the same at a hydrogen as at a potassium
+        ion. Default is 1.5 Å
     :type distA: int, float
 
     :arg residues_file_name: The file with residues will be saved in a text
@@ -5467,11 +5755,15 @@ def getLinkLiningInfo(atoms, links, callbacks={'Residues':_getLiningResidues}, *
         the same number from several chains. Pass False for the plain
         ``ASP108`` labels written by earlier versions.
     :type include_chain: bool  '''
+    info = getObjectLiningInfo(atoms, 
+                                links, 
+                                object_type='link',
+                                callbacks={'Residues':_getLiningResidues},
+                                **kwargs)
+    resnames = _infoAsListOfStrings(info)
+    return resnames
 
-    return getObjectLiningInfo(atoms, links, object_type='link', callbacks=callbacks, **kwargs)
-
-
-def getChannelLiningInfoMultipleFrames(atoms, channels, trajectory=None, callbacks={'Residues':_getLiningResidues}, **kwargs):
+def getChannelResidueNamesMultipleFrames(atoms, channels, trajectory=None, **kwargs):
     '''Provides the resnames and resid of residues that are forming the channel(s). 
     Residues are extracted based on distA which is the distance between FIL atoms 
     (channel atoms) and protein residues.
@@ -5516,12 +5808,17 @@ def getChannelLiningInfoMultipleFrames(atoms, channels, trajectory=None, callbac
         the same number from several chains. Pass False for the plain
         ``ASP108`` labels written by earlier versions.
     :type include_chain: bool  '''
+    info = getObjectLiningInfoMultipleFrames(atoms,
+                                     channels, 
+                                     trajectory=trajectory, 
+                                    object_type='channel',
+                                      callbacks={'Residues':_getLiningResidues},
+                                        **kwargs)
+    
+    resnames = _infoAsListOfStrings(info)
+    return resnames
 
-    return getObjectLiningInfoMultipleFrames(atoms, channels, trajectory=trajectory, 
-                                                object_type='channel', callbacks=callbacks, **kwargs)
-
-
-def getPoreLiningInfoMultipleFrames(atoms, pores, trajectory=None, callbacks={'Residues':_getLiningResidues}, **kwargs):
+def getPoreResidueNamesMultipleFrames(atoms, pores, trajectory=None, **kwargs):
     '''Provides the resnames and resid of residues that are forming the pore(s). 
     Residues are extracted based on distA which is the distance between FIL atoms 
     (pore atoms) and protein residues.
@@ -5566,12 +5863,18 @@ def getPoreLiningInfoMultipleFrames(atoms, pores, trajectory=None, callbacks={'R
         the same number from several chains. Pass False for the plain
         ``ASP108`` labels written by earlier versions.
     :type include_chain: bool  '''
+    info = getObjectLiningInfoMultipleFrames(atoms,
+                                     pores, 
+                                     trajectory=trajectory, 
+                                    object_type='pore',
+                                      callbacks={'Residues':_getLiningResidues},
+                                        **kwargs)
+    
+    resnames = _infoAsListOfStrings(info)
+    return resnames
 
-    return getObjectLiningInfoMultipleFrames(atoms, pores, trajectory=trajectory,
-                                                    object_type='pore', callbacks=callbacks, **kwargs)
 
-
-def getLinkLiningInfoMultipleFrames(atoms, links, trajectory=None, callbacks={'Residues':_getLiningResidues}, **kwargs):
+def getLinkResidueNamesMultipleFrames(atoms, links, trajectory=None, callbacks={'Residues':_getLiningResidues}, **kwargs):
     '''Provides the resnames and resid of residues that are forming the chamber
     link(s) in multiple frames/models.
 
@@ -5620,9 +5923,15 @@ def getLinkLiningInfoMultipleFrames(atoms, links, trajectory=None, callbacks={'R
         the same number from several chains. Pass False for the plain
         ``ASP108`` labels written by earlier versions.
     :type include_chain: bool  '''
-
-    return getObjectLiningInfoMultipleFrames(atoms, links, trajectory=trajectory,
-                                               object_type='link', callbacks=callbacks, **kwargs)
+    info = getObjectLiningInfoMultipleFrames(atoms,
+                                     links, 
+                                     trajectory=trajectory, 
+                                    object_type='link',
+                                      callbacks={'Residues':_getLiningResidues},
+                                        **kwargs)
+    
+    resnames = _infoAsListOfStrings(info)
+    return resnames
 
 
 def getSurfaceCavityResidueNames(atoms, cavities, surface, **kwargs):
@@ -6751,9 +7060,9 @@ def calcFrequentObjectResidues(residues_all, count_residue_names=False,
     """Count residues lining channels, pores, or surface cavities by chain.
 
     This function analyzes the output returned by:
-    - getChannelLiningInfoMultipleFrames()
-    - getPoreLiningInfoMultipleFrames()
-    - getSurfaceCavityLiningInfoMultipleFrames()
+    - getChannelResidueNamesMultipleFrames()
+    - getPoreResidueNamesMultipleFrames()
+    - getSurfaceCavityResidueNamesMultipleFrames()
 
     :arg residues_all: Residue lists returned by one of the multiple-frame
         residue-reporting functions. The expected input is a list of frame/model
@@ -6777,7 +7086,7 @@ def calcFrequentObjectResidues(residues_all, count_residue_names=False,
     :type output_file_name: str or None
 
     Examples:
-    residues_all = getChannelLiningInfoMultipleFrames(protein, channels_all, trajectory=dcd)
+    residues_all = getChannelResidueNamesMultipleFrames(protein, channels_all, trajectory=dcd)
 
     counts = countObjectResiduesByChain(residues_all)
 
@@ -10908,6 +11217,1009 @@ class ChannelCalculator:
                 tetra for tetra in cavity.tetrahedra
                 if cavity.tetrahedra_depths.get(tetra, np.inf) <= max_depth])
 
+
+
+class ClusterCalculator:
+
+    global POPCOUNT_TABLE 
+    POPCOUNT_TABLE = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
+
+    def __init__(self, atoms=None, voxel_size=0.25,pad_factor=1.02,h=10,angle_deg=5.0,
+                q=1.0,n_samples=5, global_origin=None):
+        
+        self.atoms = atoms
+        self.voxel_size=voxel_size
+        self.pad_factor=pad_factor
+        self.h=h
+        self.angle_deg=angle_deg
+        self.q=q
+        self.n_samples=n_samples
+        self.global_origin = global_origin
+
+
+    class ChannelRecord:
+        """Cached geometry for one channel"""
+
+        def __init__(self,calculator, channel, conformation_id,rep_points=None,
+                    rep_radii=None, centerline_points=None,centerline_radii=None,
+                    tree=None,bbox=None,mask=None,offset=None,dims=None,volume=None,
+                    endpoint=None,r_T=None,kept=True,cluster_id=None,shell_weights=None):
+
+            self.channel = channel
+            self.conformation_id = conformation_id
+            self.calculator = calculator
+
+            #calculated later
+            self.centerline_points = centerline_points
+            self.centerline_radii = centerline_radii
+            self.dims=dims
+            self.bbox = bbox
+            self.tree = tree
+            self.mask = mask
+            self.offset = offset
+            self.volume = volume
+
+            #calculated during center sampling 
+            self.rep_points = rep_points
+            self.rep_radii = rep_radii
+            self.endpoint = endpoint
+            self.r_T = r_T
+            self.kept = kept
+            self.cluster_id = cluster_id
+            self.shell_weights = shell_weights
+
+            self.__postInit__()
+
+        def __postInit__(self):
+            """Prepare geometry that does not depend on the Metric Calcs"""
+            self.centerline_points, self.centerline_radii = _sampleObjectSpheres(self.channel,
+                                                 self.calculator.n_samples)
+            self.tree = _kdTree(self.centerline_points)
+            self.bbox = self.calculator.channelBoundBox(self.channel)                       
+
+        def _prepareVoxels(self):
+            """Prepare Voxel Representation Geometry"""
+            global_origin = self.calculator.global_origin
+            voxel_size= self.calculator.voxel_size
+            mn, mx = self.bbox
+            i0 = np.floor((mn - global_origin) / voxel_size).astype(int)
+            i1 = np.ceil((mx - global_origin) / voxel_size).astype(int)
+            self.offset = i0
+            self.dims = np.maximum(i1 - i0, 1)
+            grid_mn = global_origin + i0 * voxel_size
+            self.mask = self.calculator.voxelizeChannelAligned(self.centerline_points,
+                                                            self.centerline_radii,
+                                                            self.tree,
+                                                            self.dims,
+                                                            grid_mn)
+        
+            self.volume = (np.count_nonzero(self.mask) * self.calculator.voxel_size ** 3)
+                
+        @property
+        def bbox_min(self):
+            return self.bbox[0]
+
+        @property
+        def bbox_max(self):
+            return self.bbox[1]
+
+        @property
+        def n_shells(self):
+            if self.rep_points is None:
+                return 0
+            return len(self.rep_points)
+
+        @property
+        def n_voxels(self):
+            if self.mask is None:
+                return 0
+            return int(np.count_nonzero(self.mask))
+
+    def _buildChannelRecord(self,channel, conformation_id, voxelize=False):
+        """Top-level (picklable) worker for parallel channel voxelization."""
+        if voxelize:
+            record = self.ChannelRecord(self, channel, conformation_id)
+            record._prepareVoxels()
+            return record
+        return self.ChannelRecord(self, channel, conformation_id)
+
+##### Bounding Box Functions #####
+    def channelBoundBox(self,channel):
+        """
+        Axis-aligned bbox padded by the channel's maximum radius.
+        """
+        r = channel.radii.max() * self.pad_factor
+        mn = channel.centers.min(axis=0) - r
+        mx = channel.centers.max(axis=0) + r
+        return mn, mx
+
+    def boundBoxIntersection(self,box1, box2):
+        """
+        Return intersection bbox or None if boxes do not overlap.
+        """
+        mn = np.maximum(box1[0],box2[0])
+        mx = np.minimum(box1[1],box2[1])
+        if np.any(mx <= mn):
+            return None
+        return mn, mx
+
+    def _pairwiseBBoxOverlap(self,mn_a, mx_a, mn_b, mx_b):
+        """
+        Vectorized bbox-overlap test between two GROUPS of bboxes.
+
+        mn_a, mx_a : (m, 3) arrays - bbox corners for group A
+        mn_b, mx_b : (k, 3) arrays - bbox corners for group B
+
+        Returns an (m, k) boolean matrix, computed with a single pair of
+        broadcasted min/max calls instead of a python-level double loop.
+        Kept as its own small block (m, k, 3) rather than doing this across
+        *all* n channels at once, so memory stays O(frame_size^2) instead
+        of O(n^2).
+        """
+        lo = np.maximum(mn_a[:, None, :], mn_b[None, :, :])   # (m, k, 3)
+        hi = np.minimum(mx_a[:, None, :], mx_b[None, :, :])   # (m, k, 3)
+
+        return np.all(hi > lo, axis=-1)                       # (m, k)
+##### Bounding Box Functions #####
+
+
+##### Functions Related to the Channel Lining Residue Pipeline #####
+    def _pack(self,residue_set, n_residues):
+        arr = np.zeros(n_residues, dtype=np.uint8)
+        arr[list(residue_set)] = 1
+        return np.packbits(arr)
+
+    def _jaccardMatrix(self,packed):
+        n = packed.shape[0]
+        dist = np.zeros((n, n))
+        sizes = POPCOUNT_TABLE[packed].sum(axis=1)
+        for i in range(n):
+            inter = POPCOUNT_TABLE[packed[i] & packed].sum(axis=1)
+            union = sizes[i] + sizes - inter
+            dist[i] = 1 - inter / union
+        return dist
+##### Functions Related to the Channel Lining Residue Pipeline #####
+
+
+##### Functions Related to the Voxelization Pipeline #####
+    def _segmentProject(self,p, a, b):
+        """
+        Project points p onto segments a -> b.
+
+        Returns
+        -------
+        dist2 : ndarray
+            Squared distance from each point to the segment.
+        t : ndarray
+            Segment parameter in [0, 1].
+        """
+        ab = b - a
+
+        denom = np.einsum('ij,ij->i', ab, ab)
+        denom = np.maximum(denom, 1e-12)
+
+        t = np.einsum('ij,ij->i', p - a, ab) / denom
+        t = np.clip(t, 0.0, 1.0)
+        closest = a + t[:, None] * ab
+        diff = p - closest
+        dist2 = np.einsum('ij,ij->i', diff, diff)
+        return dist2, t
+
+
+    def _pointsInsideMask(self,query_points, points, radii, tree, refine=True):
+        """
+        Vectorized point-in-channel test, given an already-built tree.
+
+        Single tree.query() call over all query_points at once (uses
+        scipy's multi-threaded query), followed by the same vectorized
+        segment-refinement used previously - no per-point or per-segment
+        Python loop.
+        """
+        d_nn, idx = tree.query(query_points, k=1, workers=-1)
+
+        if not refine or len(points) < 3:
+            return d_nn <= radii[idx]
+
+        n = len(points)
+
+        idx_prev = np.clip(idx - 1, 0, n - 1)
+        idx_next = np.clip(idx + 1, 0, n - 1)
+
+        dist2_a, t_a = self._segmentProject(query_points,
+                                        points[idx_prev],
+                                        points[idx])
+
+        dist2_b, t_b =  self._segmentProject(query_points,
+                                        points[idx],
+                                        points[idx_next])
+
+        use_a = dist2_a < dist2_b
+        r_a = (radii[idx_prev] + t_a * (radii[idx] - radii[idx_prev]))
+        r_b = (radii[idx] + t_b * (radii[idx_next] - radii[idx]))
+        radius = np.where(use_a, r_a, r_b)
+        dist2 = np.where(use_a, dist2_a, dist2_b)
+
+        return dist2 <= radius * radius
+
+
+    def _insideChannelMask(self,query_points, prepared, refine=True):
+        """
+        Determine which query points are inside a channel, via KD-tree.
+
+        Kept for callers that need point-in-channel tests for arbitrary,
+        unstructured query points (e.g. lining queries). Not used by the
+        volume/intersection pipeline below.
+        """
+        query_points = np.asarray(query_points, dtype=float)
+
+        return self._pointsInsideMask(query_points,
+                                    prepared.points,
+                                    prepared.radii,
+                                    prepared.tree,
+                                    refine=refine)
+
+
+    def _gridPoints(self,dims, grid_mn):
+        """
+        World-space coordinates of every voxel center in a `dims`-shaped
+        grid whose first voxel center sits at `grid_mn`, built as a single
+        vectorized meshgrid (no per-voxel or per-segment Python loop).
+        """
+        voxel_size=self.voxel_size
+
+        xs = grid_mn[0] + (np.arange(dims[0]) + 0.5) * voxel_size
+        ys = grid_mn[1] + (np.arange(dims[1]) + 0.5) * voxel_size
+        zs = grid_mn[2] + (np.arange(dims[2]) + 0.5) * voxel_size
+
+        X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
+
+        return np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=-1)
+
+    def voxelizeChannelAligned(self,centers, radii, tree, dims, grid_mn):
+        voxel_size=self.voxel_size
+        if len(centers) < 2:
+            return np.zeros(dims, dtype=bool)
+
+        # Vectorized per-segment padded index boxes
+        a, b = centers[:-1], centers[1:]
+        r = np.maximum(radii[:-1], radii[1:])
+
+        seg_mn = np.minimum(a, b) - r[:, None]
+        seg_mx = np.maximum(a, b) + r[:, None]
+
+        i0 = np.clip(np.floor((seg_mn - grid_mn) / voxel_size).astype(int), 0, dims)
+        i1 = np.clip(np.ceil((seg_mx - grid_mn) / voxel_size).astype(int), 0, dims)
+
+        # Union of segment windows -> candidate voxels only
+        active = np.zeros(dims, dtype=bool)
+        for k in range(len(a)):
+            if np.any(i1[k] <= i0[k]):
+                continue
+            active[i0[k, 0]:i1[k, 0], i0[k, 1]:i1[k, 1], i0[k, 2]:i1[k, 2]] = True
+
+        idx = np.argwhere(active)
+        if len(idx) == 0:
+            return np.zeros(dims, dtype=bool)
+
+        pts = grid_mn + (idx + 0.5) * voxel_size
+
+        # One batched query, but only over the reduced candidate set.
+        inside = self._pointsInsideMask(pts, centers, radii, tree, refine=True)
+
+        grid = np.zeros(dims, dtype=bool)
+        grid[idx[:, 0], idx[:, 1], idx[:, 2]] = inside
+        return grid   
+
+    def _maskVoxelOverlapVolume(self,prepared_a, prepared_b):
+        """
+        Overlap volume of two already-voxelized, lattice-aligned channels.
+
+        Pure integer index arithmetic to find the overlapping voxel-index
+        range, then a slice + bitwise AND + count_nonzero. No rasterization,
+        no floating point, no search of any kind happens here.
+        """
+        
+        start = np.maximum(prepared_a.offset, prepared_b.offset)
+        end = np.minimum(prepared_a.offset + prepared_a.dims,
+                            prepared_b.offset + prepared_b.dims)
+
+        if np.any(end <= start):
+            return 0.0
+
+        sa0 = start - prepared_a.offset
+        sa1 = end - prepared_a.offset
+        sb0 = start - prepared_b.offset
+        sb1 = end - prepared_b.offset
+
+        sub_a = prepared_a.mask[sa0[0]:sa1[0], sa0[1]:sa1[1], sa0[2]:sa1[2]]
+        sub_b = prepared_b.mask[sb0[0]:sb1[0], sb0[1]:sb1[1], sb0[2]:sb1[2]]
+
+        count = np.count_nonzero(sub_a & sub_b)
+
+        return count * self.voxel_size ** 3
+
+
+    def _scoreVoxelOverlapPrepared(self,task):
+        """
+        Calculate Jaccard distance for one channel pair, from cached masks.
+        """
+        i, j, prepared_a, prepared_b, volume_a, volume_b,= task
+
+        vol_ab = self._maskVoxelOverlapVolume(prepared_a, prepared_b)
+        union = volume_a + volume_b - vol_ab
+        if union <= 0:
+            return i, j, 1.0
+        score = 1.0 - vol_ab / union
+        return i, j, score
+##### Functions Related to the Voxelization Pipeline #####
+
+
+##### Functions Related to the Center Sampling Pipeline #####
+    def costOf(self,record):
+        c = record.channel.cost
+        return c if c is not None else float("inf")
+
+
+    def _unit(self, v):
+        n = np.linalg.norm(v)
+        return v / n if n > 1e-12 else v
+
+
+    def computeAverageStart(self,records):
+        """S_average = centroid of starting vertices from all conformations."""
+        starts = np.array([np.asarray(r.channel.centers[0], dtype=float) for r in records])
+        return starts.mean(axis=0)
+
+    def _computeEndpoints(self, records, S):
+        """Endpoint of a channel = the point on its centerline furthest from S.
+        Not called by the current driver; kept for callers who want the
+        explicit Algorithm-2 endpoint-aggregation behavior."""
+
+        all_pts = np.stack([_sampleObjectSpheres(r.channel, self.n_samples)[0] for r in records])
+        all_dists = np.linalg.norm(all_pts - S, axis=2)          # (n, n_samples)
+        idx = np.argmax(all_dists, axis=1)
+        for k, r in enumerate(records):
+            r.endpoint = all_pts[k, idx[k]]
+        return all_pts, all_dists
+
+    def _aggregateTunnelEnds(self,records, S, amax_deg = 5.0):
+        """Algorithm 2 ("Aggregate Tunnel Ends"). Endpoints that are angularly
+        close as seen from S are merged into a single weighted point.
+
+        Streaming/sequential by construction, so not parallelized -- but the
+        inner nearest-neighbor search is one matmul instead of a per-item
+        Python loop. Not called by the current driver.
+
+        Returns a list of [point (ndarray), weight (float)].
+        """
+        amax = np.radians(amax_deg)
+        agg_points = []
+        agg_units = np.zeros((0, 3))
+
+        for r in records:
+            A = r.endpoint
+            Au = self._unit(A - S)
+
+            if agg_units.shape[0] == 0:
+                agg_points.append([A.copy(), 1.0])
+                agg_units = Au[None, :]
+                continue
+
+            cos_all = agg_units @ Au
+            i = int(np.argmax(cos_all))
+            angle = np.arccos(np.clip(cos_all[i], -1.0, 1.0))
+
+            if angle > amax:
+                agg_points.append([A.copy(), 1.0])
+                agg_units = np.vstack([agg_units, Au])
+            else:
+                B, b = agg_points[i]
+                a = 1.0
+                C_dir = self._unit(a * self._unit(A - S) + b * self._unit(B - S))
+                dist_new = (a * np.linalg.norm(A - S) + b * np.linalg.norm(B - S)) / (a + b)
+                new_point = S + dist_new * C_dir
+                agg_points[i] = [new_point, a + b]
+                agg_units[i] = self._unit(new_point - S)
+
+        return agg_points
+
+
+    def computeRepresentativePoints(self,records,S,h=10):
+        """
+        Compute centerline representative points for all ChannelRecords.
+        For each channel and each radial shell, multiple continuous centerline
+        segments are allowed. Results are stored directly on each ChannelRecord:
+
+            record.rep_points[i]  -> (n_segments, 3)
+            record.rep_radii[i]   -> (n_segments,)
+
+        The representative point of each segment is an arc-length-weighted
+        centroid, and the representative radius is an arc-length-weighted
+        mean radius.
+
+        Parameters
+        ----------
+        records : list[ChannelRecord]
+            Tunnel records.
+
+        S : array-like
+            Common start point shared by every channel/conformation. The radial
+            shell coordinate is calculated relative to THIS point (not each
+            channel's own mouth) -- that's what makes "shell i" comparable
+            across different channels in Eq. 2.
+
+        h : int
+            Number of radial shells.
+
+        angle_threshold_deg, agg_amax_deg : float
+            Retained for compatibility with the original CAVER API.
+
+        n_samples : int
+            Number of points sampled along each centerline spline.
+
+        Returns
+        -------
+        records
+            The same records with representative data populated.
+        """
+        S = np.asarray(S, dtype=np.float64)
+
+        for record in records:
+            channel = record.channel
+            centerline_spline = channel.centerline_spline
+            radius_spline = channel.radius_spline
+            n_centers = len(channel.centers)
+
+            if n_centers < 2:
+                record.rep_points = [np.asarray(channel.centers, dtype=np.float32) for _ in range(h)]
+                record.rep_radii = [np.asarray(channel.radii, dtype=np.float32) for _ in range(h)]
+                record.shell_weights = np.ones(h, dtype=np.float32)
+                continue
+
+            t = np.linspace(0.0, float(n_centers - 1), self.n_samples, dtype=np.float64)
+
+            points = np.asarray(centerline_spline(t), dtype=np.float64)
+            if points.ndim == 2 and points.shape == (3, self.n_samples):
+                points = points.T
+            points = np.asarray(points, dtype=np.float64)
+
+            radii = np.asarray(radius_spline(t), dtype=np.float64).reshape(-1)
+            radii = np.maximum(radii, 0.0)
+
+            record.centerline_points = points.astype(np.float32, copy=False)
+            record.centerline_radii = radii.astype(np.float32, copy=False)
+
+            dxyz = np.diff(points, axis=0)
+            ds = np.linalg.norm(dxyz, axis=1)
+
+            # Radial coordinate relative to the SHARED start point S -- shell i
+            # must mean the same physical distance for every channel, or the
+            # per-shell comparison in Eq. 2 is comparing unrelated things.
+            radial_distance = np.linalg.norm(points - S[None, :], axis=1)
+
+            rmin = radial_distance.min()
+            rmax = radial_distance.max()
+
+            if rmax <= rmin:
+                shell_edges = np.full(h + 1, rmin, dtype=np.float64)
+            else:
+                shell_edges = np.linspace(rmin, rmax, h + 1, dtype=np.float64)
+
+            rep_points = []
+            rep_radii = []
+
+            for shell_i in range(h):
+                lo = shell_edges[shell_i]
+                hi = shell_edges[shell_i + 1]
+
+                if shell_i == h - 1:
+                    in_shell = (radial_distance >= lo) & (radial_distance <= hi)
+                else:
+                    in_shell = (radial_distance >= lo) & (radial_distance < hi)
+
+                if not np.any(in_shell):
+                    rep_points.append(np.empty((0, 3), dtype=np.float32))
+                    rep_radii.append(np.empty((0,), dtype=np.float32))
+                    continue
+
+                change = np.flatnonzero(in_shell[1:] != in_shell[:-1]) + 1
+                starts = np.concatenate((np.array([0]), change))
+                stops = np.concatenate((change, np.array([len(in_shell)])))
+
+                shell_rep_points = []
+                shell_rep_radii = []
+
+                for start, stop in zip(starts, stops):
+                    if not in_shell[start] or stop <= start:
+                        continue
+
+                    p = points[start:stop]
+                    r = radii[start:stop]
+
+                    if len(p) == 1:
+                        shell_rep_points.append(p[0])
+                        shell_rep_radii.append(r[0])
+                        continue
+
+                    segment_ds = ds[start:stop - 1]
+                    weights = np.empty(len(p), dtype=np.float64)
+                    weights[0] = segment_ds[0] * 0.5
+                    weights[-1] = segment_ds[-1] * 0.5
+                    if len(p) > 2:
+                        weights[1:-1] = (segment_ds[:-1] + segment_ds[1:]) * 0.5
+
+                    total_weight = weights.sum()
+                    if total_weight <= 0.0:
+                        centroid = p.mean(axis=0)
+                        mean_radius = r.mean()
+                    else:
+                        centroid = np.sum(p * weights[:, None], axis=0) / total_weight
+                        mean_radius = np.sum(r * weights) / total_weight
+
+                    shell_rep_points.append(centroid)
+                    shell_rep_radii.append(mean_radius)
+
+                if shell_rep_points:
+                    rep_points.append(np.asarray(shell_rep_points, dtype=np.float32))
+                    rep_radii.append(np.asarray(shell_rep_radii, dtype=np.float32))
+                else:
+                    rep_points.append(np.empty((0, 3), dtype=np.float32))
+                    rep_radii.append(np.empty((0,), dtype=np.float32))
+
+            record.rep_points = rep_points
+            record.rep_radii = rep_radii
+            record.shell_weights = np.ones(h, dtype=np.float32)
+
+        return records
+
+    def _distanceWeights(self, h, q= 1.0):
+        """w(x) = k1*x + k2, chosen so w(0.5) = 1 and w(1)/w(0) = q."""
+        if h == 1:
+            return np.array([1.0])
+        denom = (q - 1) * 0.5 + 1.0
+        k2 = 1.0 / denom if abs(denom) > 1e-12 else 1.0
+        k1 = k2 * (q - 1)
+        x = np.arange(h) / (h - 1)
+        return k1 * x + k2
+
+
+    def _channelDistance(self, T: ChannelRecord, U: ChannelRecord, q= 1.0, eps = 1e-8):
+        """
+        Radius-normalized CAVER-style channel distance -- kept for reference /
+        small-scale use. For anything beyond a handful of channels use
+        build_distance_matrix, which computes this for every pair at once.
+
+        For each shell containing representatives in BOTH channels:
+
+            d_i = min_ab( ||A_Tia - A_Uib|| / (r_Tia + r_Uib) )
+
+        Each shell distance is clipped to [0, 1]. Empty shells are ignored
+        rather than penalized. Final distance is the weighted mean over
+        shells populated in both channels.
+        """
+        from scipy.spatial.distance import cdist
+
+        h = min(len(T.rep_points), len(U.rep_points))
+        if h == 0:
+            return 1.0
+
+        weights = self._distanceWeights(h, q)
+
+        total = 0.0
+        weight_total = 0.0
+
+        for i in range(h):
+            A = T.rep_points[i]
+            B = U.rep_points[i]
+            if len(A) == 0 or len(B) == 0:
+                continue
+
+            rA = T.rep_radii[i]
+            rB = U.rep_radii[i]
+
+            spatial = cdist(A, B)
+            radius_sum = rA[:, None] + rB[None, :]
+            normalized = spatial / np.maximum(radius_sum, eps)
+            normalized = np.minimum(normalized, 1.0)
+
+            d_i = normalized.min()
+            w = weights[i]
+            total += w * d_i
+            weight_total += w
+
+        if weight_total == 0.0:
+            return 1.0
+
+        return float(total / weight_total)
+
+
+    # --- module-level worker state for optional multiprocessing -------------
+    _worker_shell_data = None
+    _worker_weights = None
+    _worker_n = None
+
+
+    def _initDistanceWorker(self, shell_data, weights, n):
+        """Populate worker-local state used by _distance_block(). Only the
+        small per-shell flattened representative arrays are sent to each
+        worker (via ProcessPoolExecutor's initializer/initargs), not the full
+        Channel objects."""
+        global _worker_shell_data, _worker_weights, _worker_n
+        _worker_shell_data = shell_data
+        _worker_weights = np.asarray(weights, dtype=np.float32)
+        _worker_n = n
+
+
+    def _prepareAllShells(self, records, h):
+        """
+        Flatten every shell's representatives across all channels, ONCE, and
+        also precompute the TARGET-side grouping (group_starts/group_ids)
+        ONCE per shell -- these don't depend on which row-block is being
+        processed, so recomputing them per block (as a naive port would) is
+        pure waste. Only the SOURCE side is grouped per block, inside
+        _distance_block, since that genuinely differs per block.
+
+        Returns a list of length h, each element:
+            (points, radii, channel_ids, group_starts, group_ids)
+
+        channel_ids is sorted (built via np.repeat over np.arange(n)), and a
+        channel with an empty shell simply doesn't appear in it.
+        """
+        n = len(records)
+        per_shell = []
+
+        for s in range(h):
+            pts_list = [r.rep_points[s] for r in records]
+            lens = np.fromiter((len(p) for p in pts_list), dtype=np.int64, count=n)
+
+            if lens.sum() == 0:
+                per_shell.append((np.empty((0, 3), dtype=np.float32),
+                                    np.empty((0,), dtype=np.float32),
+                                    np.empty((0,), dtype=np.int32),
+                                    np.empty((0,), dtype=np.int64),
+                                    np.empty((0,), dtype=np.int32)))
+                continue
+
+            points = np.concatenate(pts_list, axis=0)
+            radii = np.concatenate([r.rep_radii[s] for r in records], axis=0)
+            channel_ids = np.repeat(np.arange(n, dtype=np.int32), lens)
+
+            group_starts = np.r_[0, np.flatnonzero(np.diff(channel_ids)) + 1]
+            group_ids = channel_ids[group_starts]
+
+            per_shell.append((points, radii, channel_ids, group_starts, group_ids))
+
+        return per_shell
+
+
+    def _distanceBlock(self, block):
+        """
+        Calculate one row-block of the channel-distance matrix.
+
+        SOURCE-side grouping (this block's channels) is computed here since it
+        depends on `block`. TARGET-side grouping (group_starts/group_ids) is
+        read from the shared, precomputed shell data -- computed once in
+        _prepare_all_shells, not once per (shell, block) pair.
+        """
+        start, end = block
+
+        shell_data = _worker_shell_data
+        weights = _worker_weights
+        n = _worker_n
+        h = len(weights)
+        block_n = end - start
+
+        Db = np.zeros((block_n, n), dtype=np.float32)
+        Wb = np.zeros((block_n, n), dtype=np.float32)
+
+        for shell in range(h):
+            w = weights[shell]
+            if w == 0:
+                continue
+
+            points, radii, channel_ids, group_starts, group_ids = shell_data[shell]
+            if len(points) == 0:
+                continue
+
+            # channel_ids is globally sorted, so searchsorted is cheaper than a
+            # boolean mask over the full array.
+            first = np.searchsorted(channel_ids, start, side="left")
+            last = np.searchsorted(channel_ids, end, side="left")
+            if first >= last:
+                continue
+
+            A = points[first:last]
+            rA = radii[first:last]
+            idA = channel_ids[first:last] - start          # local to this block, still sorted
+
+            B = points
+            rB = radii
+
+            spatial = cdist(A, B)
+            normalized = spatial / np.maximum(rA[:, None] + rB[None, :], 1e-8)
+            np.minimum(normalized, 1.0, out=normalized)
+
+            # Reduce SOURCE representatives -> one row per source channel.
+            source_change = np.flatnonzero(np.diff(idA)) + 1
+            source_starts = np.r_[0, source_change]
+            source_ids = idA[source_starts]
+            source_reduced = np.minimum.reduceat(normalized, source_starts, axis=0)
+
+            # Reduce TARGET representatives using the CACHED grouping.
+            target_reduced = np.minimum.reduceat(source_reduced, group_starts, axis=1)
+
+            Db[np.ix_(source_ids, group_ids)] += w * target_reduced
+            Wb[np.ix_(source_ids, group_ids)] += w
+
+        valid_pairs = Wb > 0
+        Db[valid_pairs] /= Wb[valid_pairs]
+        Db[~valid_pairs] = 1.0     # no shell populated in both -> maximally different
+
+        return start, end, Db
+
+
+    def computeThroughput(self, records):
+        """throughput = exp(-cost). Stored as `channel.throughput` (added
+        dynamically -- not part of your original Channel fields)."""
+        costs = np.array([r.channel.cost if r.channel.cost is not None else np.inf for r in records])
+        throughputs = np.exp(-costs)
+        for r, t in zip(records, throughputs):
+            r.channel.throughput = float(t)
+
+##### Functions Related to the Center Sampling Pipeline #####
+
+
+
+
+
+
+
+
+def buildCenterlineDistanceMatrix(channels_per_frame,h=10,n_samples=5,
+                                angle_deg=5.0, q=1.0, dtype=np.float32, 
+                                block_size=None, n_jobs=1, **kwargs):
+    """
+    Build the full pairwise normalized channel-distance matrix (Eq. 2),
+    honoring the multi-segment-per-shell representation. Distance is in
+    [0, 1]; two channels with no populated shell in common get distance 1.
+
+    :arg dtype: use np.float32 to halve memory for large n.
+    :arg block_size: compute D in row-blocks of this size instead of one
+        shot. Bounds peak working memory during the cdist calls and
+        enables `n_jobs`.
+    :arg n_jobs: with block_size set, distribute row-blocks across worker
+        processes (cheap: only the small flattened shell_data, not the
+        full channels, is sent to each worker via an initializer).
+    """
+    import multiprocessing
+    from multiprocessing import Pool
+
+    clustercalc = ClusterCalculator(h=h,angle_deg=angle_deg,q=q,n_samples=n_samples)
+    records= []
+    for conf_id, channels in enumerate(channels_per_frame):
+        for ch in channels:
+            if ch.cost is None:
+                raise ValueError(
+                    "Channel.cost is None -- required to rank channels by "
+                    "cost throughout the clustering pipeline.")
+            if ch.centerline_spline is None:
+                raise ValueError(
+                    "Channel.centerline_spline is None -- call "
+                    "channel._buildSplines() (e.g. after unpickling) "
+                    "before clustering.")
+            records.append(clustercalc._buildChannelRecord(channel=ch, conformation_id=conf_id))
+    
+    if not records:
+        return None
+
+    S = clustercalc.computeAverageStart(records)
+
+    clustercalc.computeRepresentativePoints(records, S, h=h)
+
+    n = len(records)
+    if n == 0:
+        return np.empty((0, 0), dtype=dtype)
+
+    h = min(len(r.rep_points) for r in records)
+    weights = clustercalc.computeDistanceWeights(h, q).astype(np.float32)
+
+    shell_data = clustercalc._prepareAllShells(records, h)   # built ONCE, shared by every block/worker
+
+    if block_size is None:
+        block_size = n
+    block_size = max(1, int(block_size))
+
+    D = np.empty((n, n), dtype=dtype)
+    blocks = [(start, min(start + block_size, n)) for start in range(0, n, block_size)]
+
+    if max_proc is None:
+        max_proc = max(1, multiprocessing.cpu_count() // 2)
+    mp_context = kwargs.get('mp_context')
+    if mp_context is None:
+        ctx = multiprocessing.get_context()
+    else:
+        ctx = multiprocessing.get_context(mp_context)
+
+    if max_proc == 1:
+        clustercalc._initDistanceWorker(shell_data, weights, n)
+        for block in blocks:
+            start, end, Db = clustercalc._distanceBlock(block)
+            D[start:end] = Db
+    else:
+        with ctx.Pool(processes=max_proc) as pool:
+            with pool(max_workers=n_jobs,initializer=clustercalc._initDistanceWorker,initargs=(shell_data, weights, n)) as ex:
+                for start, end, Db in ex.map(clustercalc._distanceBlock, blocks):
+                    D[start:end] = Db
+
+    D = np.minimum(D, D.T)          # enforce exact numerical symmetry
+    np.fill_diagonal(D, 0.0)
+    return D
+
+
+
+def buildVoxelOverlapDistanceMatrix(channels, voxel_size=0.25, max_proc=1,
+                                                    mp_context=None, pad_factor=1.02,
+                                                    interframe_only=False, **kwargs):
+    """
+    Calculate pairwise spatial distance between channels.
+
+    Every channel is voxelized exactly once, onto a shared lattice
+    (common origin + voxel pitch). Pairwise overlap is then just
+    integer-indexed slicing and a bitwise AND between cached masks -
+    no repeated rasterization and no KD-tree queries at comparison
+    time.
+
+    Parameters
+    ----------
+    channels : list
+        List of channel lists, e.g. channels from multiple frames.
+
+    voxel_size : float
+        Voxel size used for volume/intersection calculations.
+
+    metric : str
+        Currently supports 'jaccard':
+            1 - intersection / union
+
+    max_proc : int or None
+        Number of worker processes, used for the (embarrassingly
+        parallel) per-channel voxelization step.
+
+    mp_context : str or None
+        Multiprocessing context, e.g. 'fork'.
+
+    interframe_only : bool
+        If True (default), channel pairs belonging to the same frame
+        are never compared - those entries in `D` are left as NaN
+        rather than being computed. This is the common case: you care
+        about how a channel in frame i relates to channels in frame j,
+        not about channels within the same frame. Set False to restore
+        the old all-pairs behavior.
+
+    Returns
+    -------
+    D : ndarray
+        Symmetric pairwise spatial distance matrix. Diagonal is 0.
+        Entries for skipped same-frame pairs (when interframe_only is
+        True) are NaN, distinguishing "not computed" from an actual
+        max-distance (1.0) result.
+
+    volumes : ndarray
+        Estimated volume of every channel.
+    """
+    import multiprocessing
+    from multiprocessing import Pool
+
+    num_frams = len(channels)
+    flat_channels = []
+    frame_slices = []
+    start = 0
+    for channel_group in channels:
+        flat_channels.extend(channel_group)
+        end = start + len(channel_group)
+        frame_slices.append((start, end))
+        start = end
+    n = len(flat_channels)
+
+    frame_ids = np.empty(n, dtype=int)
+    for frame_id, (start, end) in enumerate(frame_slices):
+        frame_ids[start:end] = frame_id
+
+    clustercalc = ClusterCalculator(voxel_size=voxel_size, pad_factor=pad_factor)
+    raw_bboxes = [clustercalc.channelBoundBox(c) for c in flat_channels]
+    clustercalc.global_origin = np.min([bb[0] for bb in raw_bboxes],axis=0)
+
+    if n == 0:
+        return np.empty((0, 0)), np.empty(0)
+
+    if max_proc is None:
+        max_proc = max(1, multiprocessing.cpu_count() // 2)
+
+    if mp_context is None:
+        ctx = multiprocessing.get_context()
+    else:
+        ctx = multiprocessing.get_context(mp_context)
+
+    raw_bboxes = [clustercalc.channelBoundBox(c) for c in flat_channels]
+    clustercalc.global_origin = np.min([bb[0] for bb in raw_bboxes],axis=0)
+
+
+    if max_proc == 1:
+        prepared = [clustercalc._buildChannelRecord(channel, conformation_id, voxelize=True)
+                     for conformation_id, channel in zip(frame_ids,flat_channels)]
+    else:
+        tasks = [(channel,conformation_id, True) 
+                    for conformation_id,channel in zip(frame_ids,flat_channels)]
+        chunksize = max(1,n // (max_proc * 4))
+        with ctx.Pool(processes=max_proc) as pool:
+            prepared = pool.map(clustercalc._buildChannelRecord,tasks, chunksize=chunksize)
+
+
+    volumes = np.asarray([p.volume for p in prepared], dtype=float)
+
+
+    if interframe_only:
+        D = np.full((n, n), np.nan, dtype=float)
+    else:
+        D = np.ones((n, n), dtype=float)
+
+    np.fill_diagonal(D, 0.0)
+
+    bboxes_mn = np.array([p.bbox[0] for p in prepared])
+    bboxes_mx = np.array([p.bbox[1] for p in prepared])
+
+    tasks = []
+
+    frame_pairs = [(f1, f2)
+                    for f1 in range(num_frams)
+                    for f2 in range(f1, num_frams)
+                    if f1 != f2 or not interframe_only]
+
+    for f1, f2 in frame_pairs:
+        a0, a1 = frame_slices[f1]
+        b0, b1 = frame_slices[f2]
+
+        overlap = clustercalc._pairwiseBBoxOverlap(bboxes_mn[a0:a1], bboxes_mx[a0:a1],bboxes_mn[b0:b1], bboxes_mx[b0:b1])
+
+        if f1 == f2:
+            overlap &= np.triu(np.ones_like(overlap), k=1).astype(bool)
+
+        local_i, local_j = np.nonzero(overlap)
+
+        for li, lj in zip(local_i.tolist(), local_j.tolist()):
+            i = a0 + li
+            j = b0 + lj
+
+            tasks.append((i,j,prepared[i],prepared[j],volumes[i],volumes[j]))
+
+    scores = [clustercalc._scoreVoxelOverlapPrepared(task) for task in tasks]
+
+    for i, j, score in scores:
+        D[i, j] = score
+        D[j, i] = score
+
+    return D, volumes
+
+
+def buildLiningSequenceDistanceMatrix(atoms,channels,trajectory,**kwargs):
+    resinds = getObjectLiningInfoMultipleFrames(atoms,channels,trajectory,
+                                                callbacks={'ResIndices':_getLiningResIndices},
+                                                **kwargs)
+    residue_sets = [channel_group[channel]['ResIndices'] for channel_group in resinds for channel in channel_group]
+    n_resi= len(np.unique(atoms.getResindices()))
+    clustercalc = ClusterCalculator()
+    packed = np.array([clustercalc._pack(residue_set,n_resi) for residue_set in residue_sets])
+    return clustercalc._jaccardMatrix(packed)
+
+
+
+
+
+
+
+
+
+
 #: Source of the PyMOL viewer that :func:`_writeVisScript` leaves beside the
 #: PQR output. Held inline so that this module carries everything it writes,
 #: and raw so the rank patterns keep their backslashes.
@@ -10963,7 +12275,7 @@ if cif_file:
 
 # --- Palette ---
 # CAVER 3's first six colours, from its out/pymol/modules/rgb.py in the order
-# its view.py hands them to tunnel clusters. They are what makes a CAVER figure
+# its view.py hands them to channel clusters. They are what makes a CAVER figure
 # recognisable, so they are kept verbatim. Its remaining 1000 are a long table
 # of pastels that the generator below beats on separation, so they are not.
 CAVER_PRIMARIES = [(0.0, 0.0, 1.0),    # blue
@@ -11263,134 +12575,200 @@ else:
     cmd.zoom()
     print("Success: Files loaded in perfect sequential order with custom radii!")
 '''
-#: Source of the multi-state PyMOL viewer for trajectory/ensemble runs,
-#: left beside a directory of per-frame subdirectories the same way
-#: _VIS_CHANNELS_SCRIPT is left beside a single frame's output.
+
+
 _VIS_CHANNELS_TRAJ_SCRIPT = r'''
 import glob
 import os
 import re
 import sys
 import colorsys
-import shlex
- 
-# --- args: frame-directory glob, channel pattern, optional protein/cif ---
+
+# ============================================================
+# Arguments
+# ============================================================
+
 if len(sys.argv) < 2:
-    print('Usage: pymol vis_channels_traj.py -- "frames/frame*" "chl*.pqr" [protein.pdb]')
+    print('Usage: pymol vis_channels_traj.py -- '
+          '"channels*_sp*_chl*.pqr" [protein.pdb]')
     raise SystemExit
- 
+
 args = [a for a in sys.argv[1:] if a != "--"]
-frame_glob = args[0]
-channel_pattern = args[1] if len(args) > 1 else "chl*.pqr"
-protein_file = next((a for a in args[2:] if os.path.isfile(a)), None)
- 
-frame_dirs = sorted(glob.glob(frame_glob))
-if not frame_dirs:
-    print("No frame directories matched %r" % frame_glob)
+
+channel_pattern = args[0] if args else "channels*_sp*_chl*.pqr"
+protein_file = next((a for a in args[1:] if os.path.isfile(a)), None)
+
+# ============================================================
+# Find files
+# ============================================================
+
+files = sorted(glob.glob(channel_pattern))
+
+if not files:
+    print("No channel files matched %r" % channel_pattern)
     raise SystemExit
-n_states = len(frame_dirs)
-print("Found %d frame(s) under %r" % (n_states, frame_glob))
- 
-if protein_file:
-    protein_name = os.path.splitext(os.path.basename(protein_file))[0]
-    cmd.load(protein_file, protein_name)
-    cmd.hide("everything", protein_name)
-    cmd.show("cartoon", protein_name)
-    cmd.set("all_states", 1, protein_name)  # same protein visible in every state
- 
-# --- colour palette: identical to vis_channels.py, so rank 0 is blue in both ---
-CAVER_PRIMARIES = [(0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0),
-                   (0.0, 1.0, 1.0), (1.0, 1.0, 0.0), (1.0, 0.0, 1.0)]
-GOLDEN_ANGLE = (3.0 - 5.0 ** 0.5) / 2.0
-HUE_OFFSET = 0.796
-SATURATION_VALUE = ((0.95, 0.55), (0.65, 0.65), (0.65, 0.95))
- 
-def caverColour(rank):
-    if rank < len(CAVER_PRIMARIES):
-        name, rgb = "caver%d" % (rank + 1), CAVER_PRIMARIES[rank]
-    else:
-        step = rank - len(CAVER_PRIMARIES)
-        saturation, value = SATURATION_VALUE[step % len(SATURATION_VALUE)]
-        name = "gen%d" % rank
-        rgb = colorsys.hsv_to_rgb((HUE_OFFSET + (step + 1) * GOLDEN_ANGLE) % 1.0,
-                                  saturation, value)
-    cmd.set_color(name, list(rgb))
-    return name
- 
-RANK_PATTERNS = ((r'chl(\d+)', 0), (r'cl_(\d+)', 1), (r'(\d+)', 0))
- 
-def channelRank(filename):
+
+print("Found %d channel files" % len(files))
+
+
+# ============================================================
+# Parse frame number
+# ============================================================
+
+FRAME_PATTERN = re.compile(r'^channels(\d+)(?:_|\.|$)')
+
+def frameNumber(filename):
+    """
+    Extract the trajectory frame/model number from a filename.
+
+    Examples
+    --------
+    channels0_sp0_chl0.pqr   -> 0
+    channels39_sp3_chl0.pqr  -> 39
+    channels164_sp4_chl8.pqr -> 164
+    """
     base = os.path.basename(filename)
+    match = FRAME_PATTERN.search(base)
+
+    if match:
+        return int(match.group(1))
+
+    return None
+
+# ============================================================
+# Parse channel rank
+# ============================================================
+
+RANK_PATTERNS = (
+    (r'chl(\d+)', 0),
+    (r'cl_(\d+)', 1),
+    (r'(\d+)', 0),
+)
+
+
+def channelRank(filename):
+    """
+    Extract the channel number from the filename.
+
+    For example:
+
+        channels164_sp4_chl8.pqr -> 8
+        channels39_sp0_chl4.pqr  -> 4
+    """
+    base = os.path.basename(filename)
+
     for pattern, first in RANK_PATTERNS:
         match = re.search(pattern, base)
         if match:
             return max(0, int(match.group(1)) - first)
+
     return None
- 
-def cifLoops(path):
-    # same minimal reader as vis_channels.py -- it reads back only what this
-    # module writes, not arbitrary CIF; see that script for why.
-    loops = {}
-    with open(path) as handle:
-        lines = handle.read().splitlines()
-    i = 0
-    while i < len(lines):
-        if lines[i].strip() != "loop_":
-            i += 1
-            continue
-        i += 1
-        columns, category = [], None
-        while i < len(lines) and lines[i].startswith("_"):
-            category, _, column = lines[i].strip()[1:].partition(".")
-            columns.append(column)
-            i += 1
-        rows = []
-        while i < len(lines) and lines[i] and not lines[i][0] in "#_" \
-                and not lines[i].startswith(("loop_", "data_")):
-            try:
-                tokens = shlex.split(lines[i])
-            except ValueError:
-                tokens = lines[i].split()
-            if len(tokens) == len(columns):
-                rows.append(tokens)
-            i += 1
-        loops[category] = (columns, rows)
-    return loops
- 
-# --- gather, per rank, the file/data for each frame (missing -> empty state) ---
-# rank -> {state_index (1-based): (is_cif, payload)}
-#   payload for a PQR frame is the filename
-#   payload for a CIF frame is (channel_id, [(x,y,z,radius), ...])
-by_rank = {}
-is_cif_mode = channel_pattern.lower().endswith(".cif")
- 
-for state_index, frame_dir in enumerate(frame_dirs, start=1):
-    if is_cif_mode:
-        cif_path = os.path.join(frame_dir, channel_pattern)
-        if not os.path.isfile(cif_path):
-            continue
-        loops = cifLoops(cif_path)
-        if "sb_ncbr_channel_profile" not in loops:
-            continue
-        columns, rows = loops["sb_ncbr_channel_profile"]
-        index = {name: columns.index(name) for name in columns}
-        samples = {}
-        for row in rows:
-            samples.setdefault(row[index["channel_id"]], []).append(
-                (float(row[index["x"]]), float(row[index["y"]]),
-                 float(row[index["z"]]), float(row[index["radius"]])))
-        for channel_id, spheres in samples.items():
-            rank = channelRank(channel_id)
-            rank = 0 if rank is None else rank
-            by_rank.setdefault(rank, {})[state_index] = (True, (channel_id, spheres))
+
+
+# ============================================================
+# Validate filenames
+# ============================================================
+
+entries = []
+
+for fname in files:
+
+    frame = frameNumber(fname)
+    rank = channelRank(fname)
+
+    if frame is None:
+        print("Skipping file with no frame number: %s" % fname)
+        continue
+
+    if rank is None:
+        print("Skipping file with no channel number: %s" % fname)
+        continue
+
+    entries.append((frame, rank, fname))
+
+
+if not entries:
+    print("No usable channel files found.")
+    raise SystemExit
+
+
+# ============================================================
+# Determine trajectory states
+# ============================================================
+
+frame_numbers = sorted(set(frame for frame, rank, fname in entries))
+
+frame_to_state = {
+    frame: state
+    for state, frame in enumerate(frame_numbers, start=1)
+}
+
+n_states = len(frame_numbers)
+
+print("Found %d frame(s): %s" %
+      (n_states, frame_numbers))
+
+
+# ============================================================
+# Load protein
+# ============================================================
+
+if protein_file:
+
+    protein_name = os.path.splitext(os.path.basename(protein_file))[0]
+
+    cmd.load(protein_file, protein_name)
+    cmd.hide("everything", protein_name)
+    cmd.show("cartoon", protein_name)
+    # If this is a single structure, show it in every movie state.
+    cmd.set("all_states", 1, protein_name)
+
+    print("Loaded protein: %s" % protein_name)
+
+# ============================================================
+# Palette
+# ============================================================
+
+CAVER_PRIMARIES = [
+    (0.0, 0.0, 1.0),    # blue
+    (0.0, 1.0, 0.0),    # green
+    (1.0, 0.0, 0.0),    # red
+    (0.0, 1.0, 1.0),    # cyan
+    (1.0, 1.0, 0.0),    # yellow
+    (1.0, 0.0, 1.0),    # magenta
+]
+
+GOLDEN_ANGLE = (3.0 - 5.0 ** 0.5) / 2.0
+HUE_OFFSET = 0.796
+SATURATION_VALUE = (
+    (0.95, 0.55),
+    (0.65, 0.65),
+    (0.65, 0.95),
+)
+
+
+def caverColour(rank):
+    if rank < len(CAVER_PRIMARIES):
+        name = "caver%d" % (rank + 1)
+        rgb = CAVER_PRIMARIES[rank]
     else:
-        for fname in glob.glob(os.path.join(frame_dir, channel_pattern)):
-            rank = channelRank(fname)
-            if rank is None:
-                continue
-            by_rank.setdefault(rank, {})[state_index] = (False, fname)
- 
-# --- build one discrete multi-state object per rank ---
+        step = rank - len(CAVER_PRIMARIES)
+        saturation, value = SATURATION_VALUE[step % len(SATURATION_VALUE)]
+        name = "gen%d" % rank
+        rgb = colorsys.hsv_to_rgb(
+            (HUE_OFFSET +
+             (step + 1) * GOLDEN_ANGLE) % 1.0,
+            saturation,
+            value
+        )
+    cmd.set_color(name, list(rgb))
+    return name
+
+
+# ============================================================
+# Load a PQR state
+# ============================================================
+
 def loadPqrState(fname, tmp):
     cmd.load(fname, tmp)
     radii = []
@@ -11399,54 +12777,81 @@ def loadPqrState(fname, tmp):
             if line.startswith(("ATOM", "HETATM")):
                 radii.append(float(line.split()[-1]))
     if radii:
-        cmd.alter(tmp, "vdw = radii.pop(0)", space={'radii': radii})
- 
-def loadCifState(channel_id, spheres, tmp):
-    text = "".join(
-        "ATOM  %5d  H   FIL T%4d    %8.3f%8.3f%8.3f%6.2f%6.2f\n"
-        % (i + 1, i + 1, x, y, z, 1.00, radius)
-        for i, (x, y, z, radius) in enumerate(spheres))
-    cmd.read_pdbstr(text, tmp)
-    radii = [radius for _, _, _, radius in spheres]
-    cmd.alter(tmp, "vdw = radii.pop(0)", space={'radii': radii})
- 
+        cmd.alter(
+            tmp,
+            "vdw = radii.pop(0)",
+            space={'radii': radii}
+        )
+
+
+# ============================================================
+# Group files by channel rank
+#
+# by_rank[rank][frame] = filename
+# ============================================================
+
+by_rank = {}
+for frame, rank, fname in entries:
+    by_rank.setdefault(rank, {})[frame] = fname
+
+# ============================================================
+# Build one PyMOL multi-state object per channel rank
+# ============================================================
+
 built = []
 for rank in sorted(by_rank):
-    obj, tmp = "chl%d" % rank, "chl%d_tmp" % rank
+    obj = "chl%d" % rank
+    tmp = "chl%d_tmp" % rank
     colour = caverColour(rank)
     n_written = 0
-    for state_index in range(1, n_states + 1):
-        entry = by_rank[rank].get(state_index)
-        if entry is None:
-            continue          # channel absent this frame: that state stays empty
-        is_cif, payload = entry
-        if is_cif:
-            channel_id, spheres = payload
-            loadCifState(channel_id, spheres, tmp)
-        else:
-            loadPqrState(payload, tmp)
-        cmd.create(obj, tmp, 1, state_index)
+    for frame in frame_numbers:
+        fname = by_rank[rank].get(frame)
+        if fname is None:
+            # Channel absent in this frame.
+            # Leave the corresponding state empty.
+            continue
+        state_index = frame_to_state[frame]
+        loadPqrState(fname, tmp)
+        cmd.create(obj,tmp,1,state_index)
         cmd.delete(tmp)
         n_written += 1
+
     if n_written:
         cmd.hide("everything", obj)
         cmd.show("spheres", obj)
         cmd.color(colour, obj)
         built.append(obj)
-        print("  %-10s %s  present in %d/%d frame(s)" % (obj, colour, n_written, n_states))
- 
+        print( "  %-10s %s  present in %d/%d frame(s)" % (obj,
+                                                        colour,
+                                                        n_written,
+                                                        n_states))
+
+# ============================================================
+# Group channels
+# ============================================================
+
 if built:
-    cmd.group("chnl_grp", " ".join(built))
- 
+    cmd.group( "chnl_grp"," ".join(built))
+
+# ============================================================
+# PyMOL display
+# ============================================================
+
 cmd.rebuild()
 cmd.set("sphere_scale", 1.0)
 cmd.set("sphere_quality", 2)
 cmd.bg_color("white")
 cmd.zoom()
-cmd.mset("1 -%d" % n_states)   # wire up the state slider / movie controls
-print("Success: %d channel object(s) built across %d state(s). "
-      "Step through frames with the state slider or the movie controls." %
-      (len(built), n_states))
+# Connect PyMOL movie states to the trajectory.
+cmd.mset("1 -%d" % n_states)
+
+print("Success: %d channel object(s) built across %d state(s)." % (len(built), n_states))
+
+print("Frame mapping:")
+for state, frame in enumerate(frame_numbers, start=1):
+    print("  PyMOL state %d -> frame %d" % (state, frame))
+
+cmd.save("out_traj.pse")
 '''
 
 def _writeVisScript(directory, pattern='chl*.pqr'):
@@ -11485,28 +12890,43 @@ def _writeVisScript(directory, pattern='chl*.pqr'):
         LOGGER.info('Wrote the PyMOL viewer {0}. View the output with '
                     '{1}.'.format(path, usage))
 
-def _writeVisTrajScript(directory, pattern='chl*.pqr'):
+def _writeVisTrajScript(directory, pattern='channels*_sp*_chl*.pqr'):
     """Leave ``vis_channels_traj.py`` in ``directory`` unless it is already there.
 
-    Counterpart of :func:`_writeVisScript` for a run over multiple frames: it
-    goes beside the top-level directory that holds the per-frame
-    subdirectories, not inside any one of them, since it reads across all of
-    them at once.
+    Counterpart of :func:`_writeVisScript` for a run over multiple frames:
+    channel PQR files are stored together in one directory and the frame number
+    is encoded in each filename as ``channels<frame>_..._chl<channel>.pqr``.
     """
     import os
 
     path = os.path.join(str(directory), 'vis_channels_traj.py')
-    usage = ('`pymol vis_channels_traj.py -- "frame*" "{0}"`'.format(pattern))
+
+    usage = (
+        '`pymol vis_channels_traj.py -- "{0}" [protein.pdb]`'
+        .format(pattern)
+    )
 
     if os.path.exists(path):
-        LOGGER.info('View the trajectory with the PyMOL viewer already in {0}: '
-                    '{1}.'.format(os.path.dirname(path), usage))
+        LOGGER.info(
+            'View the trajectory with the PyMOL viewer already in {0}: '
+            '{1}.'.format(os.path.dirname(path), usage)
+        )
         return
+
     try:
         with open(path, 'w') as script_file:
             script_file.write(_VIS_CHANNELS_TRAJ_SCRIPT)
+
     except (IOError, OSError) as err:
-        _warn("Could not write the PyMOL trajectory viewer {0}: {1}".format(path, err))
+
+        _warn(
+            "Could not write the PyMOL trajectory viewer {0}: {1}"
+            .format(path, err)
+        )
+
     else:
-        LOGGER.info('Wrote the PyMOL trajectory viewer {0}. View the output with '
-                    '{1}.'.format(path, usage))
+
+        LOGGER.info(
+            'Wrote the PyMOL trajectory viewer {0}. View the output with '
+            '{1}.'.format(path, usage)
+        )
