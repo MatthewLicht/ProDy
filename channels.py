@@ -8,19 +8,19 @@ __author__ = 'Karolina Mikulska-Ruminska', 'Jan Brezovsky', 'Eryk Trzcinski'
 __credits__ = ['Karolina Mikulska-Ruminska', 'Jan Brezovsky', 'Eryk Trzcinski']
 __email__ = ['karolamik@fizyka.umk.pl']
 
-import os
 import logging
 from collections import namedtuple
 from contextlib import contextmanager
-from collections import defaultdict
+
 import numpy as np
+
 from prody import LOGGER, PY3K
 from prody.atomic import Atomic
 from prody.utilities import getCoords, isListLike
 from prody.proteins import writePDB, parsePDB, parsePQR
 from prody.ensemble import Ensemble
 from prody.trajectory import Trajectory
-from prody.measure import calcCenter
+from prody.measure import calcCenter, calcTransformation, calcDistance, calcRMSD, superpose
 
 if not hasattr(np, "trapz"):
     np.trapz = np.trapezoid
@@ -28,7 +28,7 @@ if not hasattr(np, "trapz"):
 __all__ = ['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames', 
            'getChannelParameters', 'getChannelAtoms', 'showChannels', 
            'showCavities', 'showSurfaceCavities', 'selectChannelBySelection', 
-           'getChannelResidueNames',
+           'getChannelLiningInfo',
            'calcChannelSurfaceOverlaps', 'calcSurfaceCavities', 
            'calcSurfaceCavitiesMultipleFrames', 'getSurfaceCavityParameters',
            'getSurfaceCavityResidueNames', 'selectSurfaceCavityBySelection',
@@ -36,25 +36,32 @@ __all__ = ['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames',
            'getSurfaceCavityResidueNamesMultipleFrames',
            'getSurfaceCavityParametersMultipleFrames', 
            'getChannelParametersMultipleFrames', '_reportAtomsInputComposition',
-           'getChannelResidueNamesMultipleFrames', 'calcPoresFromChannels',
-           'showPores', 'getPoreParameters', 'getPoreResidueNames',
+           'getChannelLiningInfoMultipleFrames', 'calcPoresFromChannels',
+           'showPores', 'getPoreParameters', 'getPoreLiningInfo', 
            'calcPoresFromChannelsMultipleFrames', 'getPoreParametersMultipleFrames',
-           'getPoreResidueNamesMultipleFrames', 'scanChannelParameters',
-           'getLinkParameters', 'getLinkResidueNames',
-           'getLinkParametersMultipleFrames', 'getLinkResidueNamesMultipleFrames',
+           'getPoreLiningInfoMultipleFrames', 'scanChannelParameters',
+           'getLinkParameters', 'getLinkLiningInfo',
+           'getLinkParametersMultipleFrames', 'getLinkLiningInfoMultipleFrames',
            'scanSurfaceCavityParameters',
            'calcFrequentObjectResidues', 'showFrequentObjectResidues',
            'connectChannelsToSurfaceCavities',
            'calcFrequentObjectResidues', 'showFrequentObjectResidues',
-           'writeChannelsCIF',
-           'buildLiningSequenceDistanceMatrix', 'buildCenterlineDistanceMatrix',
-           'buildVoxelOverlapDistanceMatrix','prepareChannelRecords',
-           'compareClusterings', 'clusteringDistanceStats', 'computeBootstrapStability',
-            'renameChannelFilesWithClusterLabels', 'clusterChannels',
-           'writeChannelsCIF', 'writeVmdCaviTracerScript', 'writePyMolCaviTracerScript',
-           'writeChimeraXCaviTracerScript', 'mergeFramesPQR',
-           'writeChimeraXMultiModelScript', 'writePyMolMultiModelScript',
-           'writeVmdMultiModelScript']
+           'writeChannelsCIF']
+
+# Sampling of the enclosure test used to strip the moat (see
+# ChannelCalculator.calcEnclosure). These are constants, not knobs: the enclosure
+# of a point depends on how many directions are sampled and how far they are
+# followed, so min_enclosure is only meaningful against a fixed sampling. Adding
+# rays lowers every enclosure, since more directions find more of the thin ways
+# out of a channel, and so invalidates the threshold rather than refining it.
+ENCLOSURE_RAYS = 32
+ENCLOSURE_RANGE = 25.0
+ENCLOSURE_STEP = 0.75
+# One radius for every atom, on the scale of a heavy-atom vdW radius. Enclosure is
+# a burial heuristic, so resolving 1.52 A from 1.7 A would only shift every value
+# by a little and be absorbed by min_enclosure; a single radius means a single
+# tree and a plain nearest-neighbour test.
+ENCLOSURE_RADIUS = 1.7
 
 # Van der Waals radii in Angstrom, by element symbol (upper case). The radii the
 # tessellation is built on, and the ones the lining report measures a Voronoi
@@ -203,6 +210,7 @@ _CHARGED_RESIDUES = {'ARG': 1, 'LYS': 1, 'HIS': 1, 'ASP': -1, 'GLU': -1}
 _IONIZABLE_RESIDUES = frozenset(['ASP', 'GLU', 'HIS', 'CYS', 'TYR', 'LYS',
                                  'ARG'])
 
+
 _OVERLAP_OFFSET_CACHE = {}
 
 # The tag a per-object file carries in its name, against the word the same
@@ -212,6 +220,7 @@ _OVERLAP_OFFSET_CACHE = {}
 # _channel0.pqr to _chl0.pqr.
 _OBJECT_TAGS = {'chl': 'channel', 'lnk': 'link', 'pore': 'pore',
                 'cavity': 'cavity'}
+
 
 @contextmanager
 def _warningsDelivered():
@@ -322,7 +331,6 @@ def _numberedPath(filename, tag, index, suffix='', stem=None):
         stem = path.stem
     return path.with_name("{0}{1}{2}{3}{4}".format(
         stem + '_' if stem else '', tag, index, suffix, path.suffix))
-
 
 def _frameBounds(n_frames, start_frame=0, stop_frame=-1):
     """Half-open ``[first, last)`` over the 0-based frames a run covers.
@@ -532,7 +540,7 @@ def _surfaceFromPqrWorker(args):
         surface.update(map(tuple, voxels))
 
     return surface
-
+    
 
 def _calcChannelsMultipleFramesWorker(args):
     """Compute channels. Supporting function for muliprocessing in :func:`calcChannelsMultipleFrames`."""
@@ -560,8 +568,7 @@ def _calcChannelsMultipleFramesWorker(args):
             if return_details:
                 return frame_nr, [], [], {}
             return frame_nr,[],[]
-    except Exception as e:
-        print("Frame {0} failed: {1}".format(frame_nr, e))
+    except:
         if return_details:
             return frame_nr, [], [], {}
         return frame_nr, [], []
@@ -1005,7 +1012,6 @@ def getVmdModel(vmd_path, atoms, representation='NewCartoon'):
     If problem with `ipykernel.comm.Comm` class appeared while using getVmdModel
     please update dash: python -m pip install -U dash
 
-
     :arg vmd_path: Path to the VMD executable. This is required to run VMD and 
         execute the TCL script.
     :type vmd_path: str
@@ -1134,7 +1140,7 @@ def getVmdModel(vmd_path, atoms, representation='NewCartoon'):
             os.unlink(output_path)
 
         LOGGER.info("Model created successfully.")
-    return stl_mesh
+        return stl_mesh
 
 
 def showChannels(channels, model=None, surface=None):
@@ -1151,13 +1157,12 @@ def showChannels(channels, model=None, surface=None):
     conda install open3d (for Anaconda users; version open3d-0.19.0 was used 
     during the development) or pip install open3d
     
-:arg channels: A list of channel objects or a single channel object. Each
-        channel should have a `getSplines()` method that returns two
-        interpolators over one parameter domain: one for the centerline and one
-        for the radii.
+    :arg channels: A list of channel objects or a single channel object. Each 
+        channel should have a `getSplines()` method that returns two 
+        CubicSpline objects: one for the centerline and one for the radii.
     :type channels: list or single channel object
     
-    :arg model: An optional Open3D TriangleMesh object representing the
+    :arg model: An optional Open3D TriangleMesh object representing the 
         molecular model, such as a protein. If provided, this model will be 
         rendered in the visualization.
         Model can be generated using getVmdModel() function.
@@ -1670,8 +1675,8 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         residues of every channel in one file, with keys joining them, which is
         what the PQR and the residue text files cannot express between them.
         Chamber links go into the same file under
-        ``_sb_ncbr_channel.type`` ``Path``, and a directory takes
-        ``channels.cif``.
+        ``_sb_ncbr_channel.type`` ``Path``, a directory takes ``channels.cif``,
+        and no viewer script is written, that being a PQR arrangement.
     :type output_format: str
 
     :arg start_point: Optional starting point for channel search. This can be
@@ -1703,9 +1708,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         it stays in the void the point sits in rather than crossing a wall). The seed
         may therefore sit a little shallower than ``start_point`` itself, which is
         usually placed on a ligand or a catalytic residue and often lies deeper than
-        the widest part of the pocket around it. The nearest tetrahedron is kept,
-        whatever its own depth, unless a wider one qualifies, so the seed is never
-        narrower than the tetrahedron at the point.
+        the widest part of the pocket around it.
 
         It is a requirement and not only a search budget: the search must begin
         within this distance of the point, and if no cavity has a tetrahedron that
@@ -2794,19 +2797,25 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
                         sealed, '' if sealed == 1 else 's', bottleneck))
 
     if output_path and not (channels or links):
-        # Nothing found, so nothing is written. An empty file would say only
-        # that a run happened, which the count reported above already says, and
-        # it cannot be told apart from a run that failed while writing. What an
-        # earlier run left behind is worth a word, though: it survives now, and
-        # goes on looking like this run's output.
+        # Nothing found, so nothing is written - no file, and no viewer for a
+        # file that is not there. An empty file would say only that a run
+        # happened, which the count reported above already says, and it cannot
+        # be told apart from a run that failed while writing. What an earlier run
+        # left behind is worth a word, though: it survives now, and goes on
+        # looking like this run's output.
         _warnStaleOutputs(output_path, output_format, separate)
 
     elif output_path and _isMmcifFormat(output_format, separate):
-        writeChannelsCIF(output_path, channels, atoms, links=links,
-                         auto=start_point is None)
+        written = writeChannelsCIF(output_path, channels, atoms, links=links,
+                                   auto=start_point is None)
+        # As on the PQR path: only for a run told a directory. Told a file, the
+        # parent is usually the working directory, and a run has no business
+        # leaving a script there.
+        if written and Path(output_path).is_dir():
+            _writeVisScript(Path(written).parent, Path(written).name)
 
     elif output_path:
-        output_path, links_path, _, separate_stem = \
+        output_path, links_path, into_directory, separate_stem = \
             _pqrOutputPaths(output_path)
 
         # One line for the whole of what was written, so that the reader sees
@@ -2836,6 +2845,10 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
                                          separate_path=output_path,
                                          separate_stem=separate_stem,
                                          name_sites=name_sites)
+        # Only for a run told a directory. Told a file, the parent is usually
+        # the working directory, and a run has no business leaving a script there.
+        if into_directory:
+            _writeVisScript(output_path.parent)
     else:
         LOGGER.info("No output path given.")
 
@@ -3045,7 +3058,7 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
         if max_end_to_end is not None and end_to_end > max_end_to_end:
             continue
     
-        centerline_spline, radius_spline, length, bottleneck, volume, centers, radii, gates = calculator.processChannel(
+        centerline_spline, radius_spline, length, bottleneck, volume = calculator.processChannel(
                                                 pore_path, vertices, coords, vdw_radii, simplices)
         
         # Filters - bottleneck, length, volume
@@ -3064,9 +3077,7 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
         if max_volume is not None and volume > max_volume:
             continue
         
-        pore = Channel(pore_path, centerline_spline, 
-                        radius_spline, length, bottleneck,
-                         volume, centers, radii, gates, 0.0)
+        pore = Channel(pore_path, centerline_spline, radius_spline, length, bottleneck, volume, 0.0)
         pores.append(pore)
     
     if output_path and not pores:
@@ -3084,15 +3095,21 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
         # A directory takes pores.cif rather than channels.cif, for the same
         # reason the PQR path names them apart: a run writing both into one
         # folder would otherwise have the second overwrite the first.
-        writeChannelsCIF(_poreCifPath(output_path), pores, atoms,
-                         object_type='pore')
+        written = writeChannelsCIF(_poreCifPath(output_path), pores, atoms,
+                                   object_type='pore')
+        # As on the PQR path and in calcChannels: a viewer only for a run told a
+        # directory. The one script reads either format, so the hint names the
+        # file rather than a glob.
+        if written and Path(output_path).is_dir():
+            _writeVisScript(Path(written).parent, Path(written).name)
 
     elif output_path:
         output_path = Path(output_path)
         # As in calcChannels: a directory names no run, so its placeholder file
         # name is kept out of the per-pore ones.
         separate_stem = None
-        if output_path.is_dir():
+        into_directory = output_path.is_dir()
+        if into_directory:
             output_path = output_path / "pores.pqr"
             separate_stem = ''
         elif output_path.suffix not in (".pdb", ".pqr"):
@@ -3106,6 +3123,9 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
         calculator.saveChannelsToPdb(pores, output_path, separate=separate,
                                      tag='pore', label='pore',
                                      separate_stem=separate_stem)
+        # as in calcChannels, and globbing the pores rather than the channels
+        if into_directory:
+            _writeVisScript(output_path.parent, 'pore*.pqr')
 
     return pores
             
@@ -3257,12 +3277,11 @@ def connectChannelsToSurfaceCavities(channels, channel_details, cavities,
             if len(trimmed_path) < 2:
                 continue
 
-            centerline_spline, radius_spline, length, bottleneck, volume, centers, radii, gates = \
+            centerline_spline, radius_spline, length, bottleneck, volume = \
                 calculator.processChannel(trimmed_path, vertices, coords, vdw_radii, simplices)
 
             trimmed_channel = Channel(trimmed_path, centerline_spline, radius_spline,
-                                        length, bottleneck, volume,
-                                         centers, radii, gates, cost=None)
+                                        length, bottleneck, volume, cost=None)
 
             trimmed_channel.origin = getattr(channel, 'origin', None)
             trimmed_channel.destination = getattr(channel, 'destination', None)
@@ -3394,10 +3413,10 @@ def calcChannelsMultipleAtomGroups(atomgroups, output_path=None,
         return channels_all, surfaces_all
     
     max_proc = kwargs.pop('max_proc',None)
-    
+    chunksize = max(1, len(atomgroups)//(max_proc*4))
     if max_proc is None:
         max_proc = max(1, cpu_count()//2)
-    chunksize = max(1, len(atomgroups)//(max_proc*4))
+    
     if max_proc == 1:
         results = [_calcChannelsMultipleFramesWorker(task)
                     for task in tasks]
@@ -3408,10 +3427,9 @@ def calcChannelsMultipleAtomGroups(atomgroups, output_path=None,
             ctx = multiprocessing.get_context(mp_context)
         
         with ctx.Pool(processes=max_proc) as pool:
-            results_unordered = pool.imap_unordered(_calcChannelsMultipleFramesWorker, tasks,chunksize=chunksize )
-            results = [result for result in results_unordered]
-            results.sort(key=lambda x: x[0])
+            results = pool.map(_calcChannelsMultipleFramesWorker, tasks,chunksize=chunksize )
 
+    results.sort(key=lambda x: x[0])
     failed_idx = []
     for result in results:
         if return_details:
@@ -3419,9 +3437,9 @@ def calcChannelsMultipleAtomGroups(atomgroups, output_path=None,
             details_all.append(details)
         else:
             idx, channels, surfaces = result
-        # if channels is None and surfaces is None:
-        #     LOGGER.warning(f"WARNING: {idx} failed or No Channels Detected")
-        #     failed_idx.append(idx)
+        if channels is None and surfaces is None:
+            LOGGER.warning(f"WARNING: {idx} failed or No Channels Detected")
+            failed_idx.append(idx)
         channels_all.append(channels)
         surfaces_all.append(surfaces)
 
@@ -3430,9 +3448,9 @@ def calcChannelsMultipleAtomGroups(atomgroups, output_path=None,
             channel._buildSplines()
 
     if return_details:
-        return channels_all, surfaces_all, details_all
+        return channels_all, surfaces_all, details_all, failed_idx
 
-    return channels_all, surfaces_all
+    return channels_all, surfaces_all, failed_idx
 
               
 def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None, 
@@ -3465,13 +3483,11 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         Default is False.
     :type separate: bool
 
-    :arg start_point: Optional starting point for channel search, applied to every
-        frame. If provided, the search is restricted to the cavity holding the
-        tetrahedron nearest the point and is seeded there, overriding the default
-        automatic seed selection; see :func:`calcChannels` for how the seed is
-        picked and for ``start_point_search``, which bounds how far from the point
-        it may lie. Coordinates must be given in Å.
-    :type start_point: list, tuple, or ndarray (length 3), or None
+    :arg start_point: Optional starting point for channel search. If provided, 
+        the algorithm will use the tetrahedron whose Voronoi vertex is closest 
+        to this point as the starting tetrahedron (overriding the default automatic 
+        seed selection based on the deepest tetrahedron). Coordinates must be given in Å.
+    :type start_point: list, tuple, or ndarray (length 3), or None 
 
     :arg max_proc: Maximum number of parallel processes used for calculation. 
         If 1, files are processed serially. If None, all available CPU
@@ -3500,9 +3516,8 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
 
     Example usage:
     channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
-                                    output_path="channels.pdb", separate=False, 
-                                    surf_radius=15, 
-                                    inner_radius=1.2, min_depth=5, bottleneck=1, sparsity=6)
+                                    output_path="channels.pdb", separate=False, surf_radius=3, 
+                                    inner_radius=0.9, min_depth=5, bottleneck=1, sparsity=3)
                                   
     channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
                                     output_path="channels.pdb", separate=False, 
@@ -3531,65 +3546,49 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
     return_details = kwargs.pop('return_details', False)
     start_frame = kwargs.pop('start_frame', 0)
     stop_frame = kwargs.pop('stop_frame', -1)
-    # Read rather than popped: the worker forwards the rest of kwargs to
-    # calcChannels, which is where the format takes effect. It is wanted here only
-    # to name the per-frame files. The schema describes one structure and has no
-    # frame of its own, so a frame per file is what keeps each written file
-    # something the schema can describe - the same arrangement the PQR path uses.
-    frame_suffix = '.cif' if _isMmcifFormat(
-        kwargs.get('output_format', 'pqr'), separate) else '.pqr'
+    
     if output_path:
         output_path = Path(output_path)
-        if output_path.suffix in ('.pqr', '.cif'):
+        if output_path.suffix == ".pqr":
             output_path = output_path.with_suffix('')
 
     if trajectory is not None:
-        if isinstance(trajectory, Atomic):
-            trajectory = Ensemble(trajectory)
+        if not isinstance(trajectory, Trajectory) and not isinstance(trajectory, Ensemble):
+            raise ValueError("trajectory must be a Trajectory or Ensemble object.")
 
-        # `_nfi` is a DCD read cursor, so only a file-backed trajectory has one;
-        # an Ensemble holds its coordinates in memory and has nothing to rewind.
-        # Reading it unguarded made every in-memory input raise, the conversion
-        # just above included - the one branch written to accept an Atomic turned
-        # it into the very type that could not survive the next line.
-        nfi = getattr(trajectory, '_nfi', None)
-        if hasattr(trajectory, 'reset'):
-            trajectory.reset()
-
-        first, last = _frameBounds(None, start_frame, stop_frame)
-        traj = trajectory[first:last]
-
-        atoms_copy = atoms.copy()
-        for j0, frame0 in enumerate(traj, start=first):
+        if stop_frame == -1:
+            traj = trajectory[start_frame:]
+        else:
+            traj = trajectory[start_frame:stop_frame+1]
+        
+        
+        for j0, frame0 in enumerate(traj, start=start_frame):
             if output_path:
-                frame_output_path = _frameOutputPath(output_path, j0, "channels",
-                                                     frame_suffix)
+                frame_output_path = _frameOutputPath(output_path, j0, "channels")
+            else:
+                frame_output_path = None
+            atoms_copy = atoms.copy()
+            tasks.append((j0, atoms_copy, np.array(frame0.getCoords(), copy=True),
+                            frame_output_path, separate, start_point, return_details, kwargs))
+
+    elif atoms.numCoordsets() > 1:
+        # if not atoms.numCoordsets() > 1:
+        #     atoms.addCoordset(trajectory.getCoordsets())
+        coordsets = atoms.getCoordsets()
+        for i in range(len(atoms.getCoordsets()[start_frame:stop_frame])):
+            model_nr = i + start_frame
+
+            if output_path:
+                frame_output_path = _frameOutputPath(output_path, model_nr,
+                                                    "channels")
             else:
                 frame_output_path = None
             
-            tasks.append((j0, atoms_copy, np.array(frame0.getCoords(), copy=True),
+            tasks.append((model_nr, atoms, np.array(coordsets[model_nr], copy=True),
                             frame_output_path, separate, start_point, return_details, kwargs))
-        if nfi is not None:
-            trajectory._nfi = nfi
-
+            
     else:
-        if atoms.numCoordsets() > 1:
-            coordsets = atoms.getCoordsets()
-            first, last = _frameBounds(len(coordsets), start_frame, stop_frame)
-            for model_nr in range(first, last):
-
-                if output_path:
-                    frame_output_path = _frameOutputPath(output_path, model_nr,
-                                                         "channels",
-                                                         frame_suffix)
-                else:
-                    frame_output_path = None
-                
-                tasks.append((model_nr, atoms, np.array(coordsets[model_nr], copy=True),
-                                frame_output_path, separate, start_point, return_details, kwargs))
-                
-        else:
-            LOGGER.info("Include trajectory or use multi-model PDB file.")
+        LOGGER.info("Include trajectory or use multi-model PDB file.")
 
     import multiprocessing
 
@@ -3613,9 +3612,9 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
             ctx = multiprocessing.get_context(mp_context)
 
         with ctx.Pool(processes=max_proc) as pool:
-            results = pool.map(_calcChannelsMultipleFramesWorker, tasks)
-            
-
+            results = pool.map(_calcChannelsMultipleFramesWorker, tasks,chunksize=chunksize)
+    
+    results.sort(key=lambda x: x[0])
     for result in results:
         if return_details:
             _, channels, surfaces, details = result
@@ -3631,19 +3630,9 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
             channel._buildSplines()
 
     output_format = kwargs.get('output_format', 'pqr')
-    if output_path is not None and Path(output_path).is_dir() and (
-            output_format == 'mmcif' or separate):
-
-        channel_pattern = (
-            'channels.cif'
-            if output_format == 'mmcif'
-            else 'channels*_sp*_chl*.pqr'
-        )
-
-        _writeVisTrajScript(
-            output_path,
-            pattern=channel_pattern
-        )
+    if output_path is not None and Path(output_path).is_dir() and (output_format == 'mmcif' or separate):
+        channel_pattern = 'channels.cif' if output_format == 'mmcif' else 'chl*.pqr'
+        _writeVisTrajScript(output_path, pattern=channel_pattern)
     elif output_path is not None and not separate and output_format != 'mmcif':
         LOGGER.info("Wrote combined channels.pqr per frame; re-run with "
                     "separate=True for a multi-state PyMOL viewer, which "
@@ -3750,20 +3739,19 @@ def calcSurfaceCavitiesMultipleFrames(atoms, trajectory=None, output_path=None,
             output_path = output_path.with_suffix('')
 
     if trajectory is not None:
-        if isinstance(trajectory, Atomic):
+        if isinstance(trajectory,Atomic):
             trajectory = Ensemble(trajectory)
 
-        # As in calcChannelsMultipleFrames: only a file-backed trajectory carries
-        # a read cursor, and an in-memory one has nothing to save or rewind.
-        nfi = getattr(trajectory, '_nfi', None)
-        if hasattr(trajectory, 'reset'):
-            trajectory.reset()
-
-        first, last = _frameBounds(None, start_frame, stop_frame)
-        traj = trajectory[first:last]
+        nfi = trajectory._nfi
+        trajectory.reset()
+        
+        if stop_frame == -1:
+            traj = trajectory[start_frame:]
+        else:
+            traj = trajectory[start_frame:stop_frame + 1]
 
         atoms_copy = atoms.copy()
-        for j0, frame0 in enumerate(traj, start=first):
+        for j0, frame0 in enumerate(traj, start=start_frame):
             if output_path:
                 frame_output_path = _frameOutputPath(output_path, j0,
                                                      "cavities")
@@ -3773,16 +3761,18 @@ def calcSurfaceCavitiesMultipleFrames(atoms, trajectory=None, output_path=None,
             tasks.append((j0, atoms_copy, np.array(frame0.getCoords(), copy=True),
                           frame_output_path, separate, kwargs))
 
-        if nfi is not None:
-            trajectory._nfi = nfi
+        trajectory._nfi = nfi
 
     else:
         if atoms.numCoordsets() > 1:
             coordsets = atoms.getCoordsets()
 
-            first, last = _frameBounds(len(coordsets), start_frame, stop_frame)
+            if stop_frame == -1:
+                model_indices = range(start_frame, len(coordsets))
+            else:
+                model_indices = range(start_frame, stop_frame + 1)
 
-            for i in range(first, last):
+            for i in model_indices:
                 if output_path:
                     frame_output_path = _frameOutputPath(output_path, i,
                                                          "cavities")
@@ -3900,11 +3890,7 @@ def calcPoresFromChannelsMultipleFrames(channels_all, details_all, output_path=N
             output_path = output_path.with_suffix('.pqr')
 
     tasks = []
-    for position, (channels, details) in enumerate(zip(channels_all, details_all)):
-        # The frame the channels came from, as calcChannelsMultipleFrames records
-        # it, so that a run started past frame 0 keeps its numbers; details put
-        # together otherwise are numbered by position, as they always were.
-        frame_nr = details.get('frame', position)
+    for frame_nr, (channels, details) in enumerate(zip(channels_all, details_all)):
         if into_directory:
             frame_output_path = _frameOutputPath(output_path, frame_nr, "pores")
         elif output_path is not None:
@@ -3930,161 +3916,10 @@ def calcPoresFromChannelsMultipleFrames(channels_all, details_all, output_path=N
         
         with ctx.Pool(processes=max_proc) as pool:
             pores_all = pool.map(_calcPoresFromChannelsWorker, tasks)
-
-    return pores_all
-
-
-def mergeFramesPQR(inputs, filename, prefix=None, frames=None, links=False):
-    """Merge the per-frame PQR files of a multi-frame run into one multi-model
-    PQR, a ``MODEL`` block per frame.
-
-    :func:`calcChannelsMultipleFrames` and the other multi-frame functions write
-    a file per frame, the frame number ending its name: ``channels12.pqr`` in a
-    directory, ``<output_path>12.pqr`` otherwise. This gathers them after the
-    run into the one file the multi-model viewer scripts read.
-
-    The ``MODEL`` number is the frame number rather than a count, so a frame
-    keeps its number whatever else was merged, and the files of two frame
-    ranges concatenate without renumbering.
-
-    A frame that found nothing left no file, but still gets its ``MODEL``, so
-    that every frame keeps its place in a viewer that steps through the models
-    in order rather than by their numbers. The block holds a ``REMARK`` saying
-    so and a single ``NIL`` atom of radius 0 at the previous frame's first
-    sphere: an empty ``MODEL`` is dropped altogether by ChimeraX, and ``NIL``,
-    unlike the ``FIL`` of every sphere, is never read as a channel. Such frames
-    are found between the first and the last file; an empty first or last
-    frame leaves no trace in the files, so *frames* names them.
-
-    Each frame's records are copied as they stand, blank lines aside. Its serial
-    numbers start from 1 as they did in its own file, which keeps them within
-    the five columns a PQR serial has, however many frames there are.
-
-    :arg inputs: the per-frame files: a directory, a glob pattern, or a list
-        of paths.
-    :type inputs: str or list
-
-    :arg filename: the multi-model PQR to write.
-    :type filename: str
-
-    :arg prefix: the part of the names before the frame number, such as
-        ``'channels'``. Only files named ``<prefix><frame>.pqr`` are taken. Needed
-        only where the files given are of more than one kind, as in a directory
-        written with ``separate=True``, which holds ``channels12_chl3.pqr`` beside
-        ``channels12.pqr``. Default is the one prefix all the names share.
-    :type prefix: str
-
-    :arg frames: every frame of the run, such as ``range(len(channels_all))``
-        for one over a whole trajectory. Those with no file are written with
-        a placeholder, first and last included; a file of a frame not listed
-        is still merged. Default is the frames between the first and the last
-        file found.
-    :type frames: list or range
-
-    :arg links: merge the chamber links a run writes beside each frame's
-        channels, ``<prefix><frame>_links.pqr``, rather than the channels
-        themselves, into a multi-model file of their own. Default is **False**.
-    :type links: bool
-
-    :returns: the filename written
-    :rtype: str
-
-    Usage:
-    channels_all, surfaces_all = calcChannelsMultipleFrames(atoms,
-        trajectory=dcd, output_path='frames')
-    mergeFramesPQR('frames', 'channels_frames.pqr',
-                   frames=range(len(channels_all)))
-    mergeFramesPQR('frames', 'links_frames.pqr',
-                   frames=range(len(channels_all)), links=True)"""
-
-    import glob
-    import os
-    import re
-
-    if isinstance(inputs, (list, tuple)):
-        paths = [str(path) for path in inputs]
-    elif os.path.isdir(str(inputs)):
-        paths = glob.glob(os.path.join(str(inputs), '*.pqr'))
-    else:
-        paths = glob.glob(str(inputs))
-
-    # The frame is the number ending the name - or ending it before _links, for
-    # the links written beside a frame's channels - and what comes before it
-    # says what kind of file it is. A name ending otherwise is no frame's file
-    # and is passed over, as the links are when the channels are merged; one of
-    # another kind, a separate channel's <name>12_chl3.pqr, would be read as
-    # frame 3 and is refused below instead.
-    tail = '_links.pqr' if links else '.pqr'
-    pattern = re.compile(r'^(.*?)(\d+)' + re.escape(tail) + '$')
-    found = {}
-    for path in paths:
-        match = pattern.match(os.path.basename(path))
-        if match is None or (prefix is not None and match.group(1) != prefix):
-            continue
-        found.setdefault(match.group(1), {}).setdefault(
-            int(match.group(2)), []).append(path)
-
-    if not found:
-        raise ValueError('no per-frame PQR files found in {0!r} named {1}<frame>'
-                         '{2}'.format(inputs, prefix or '<prefix>', tail))
-    if len(found) > 1:
-        # Shortest first, which puts the frames' own files ahead of the
-        # per-channel ones, of which there are as many kinds as frames.
-        named = sorted(found, key=lambda name: (len(name), name))
-        raise ValueError('the files are of more than one kind, named {0}{1}; '
-                         'choose the one to merge with prefix='.format(
-                             ', '.join(name + '<frame>' + tail for name in named[:4]),
-                             ', ...' if len(named) > 4 else ''))
-
-    (stem, files), = found.items()
-    for frame, given in sorted(files.items()):
-        if len(given) > 1:
-            raise ValueError('frame {0} is given more than once: {1}'.format(
-                frame, ', '.join(given)))
-    files = dict((frame, given[0]) for frame, given in files.items())
-
-    if frames is None:
-        numbers = list(range(min(files), max(files) + 1))
-    else:
-        numbers = sorted(set(int(frame) for frame in frames) | set(files))
-    empty = [frame for frame in numbers if frame not in files]
-
-    # Where a placeholder sits: the first sphere of the frame before it, or of
-    # the first frame with a file for frames that come before any.
-    with open(files[min(files)]) as handle:
-        anchor = next((line[30:54] for line in handle
-                       if line.startswith(('ATOM', 'HETATM'))), None)
-
-    with open(str(filename), 'w') as out:
-        out.write('REMARK   {0} frames of {1}<frame>{2}, one MODEL each\n'.format(
-            len(numbers), stem, tail))
-        out.write('REMARK   MODEL numbers are frame numbers\n')
-        if empty:
-            out.write('REMARK   {0} frame{1} found nothing: a NIL atom of radius 0 '
-                      'holds each place\n'.format(
-                          len(empty), '' if len(empty) == 1 else 's'))
-        for frame in numbers:
-            out.write('MODEL%9d\n' % frame)
-            if frame in files:
-                with open(files[frame]) as handle:
-                    lines = [line for line in handle
-                             if line.strip() and line.split()[0] != 'END']
-                out.writelines(lines)
-                anchor = next((line[30:54] for line in lines
-                               if line.startswith(('ATOM', 'HETATM'))), anchor)
-            else:
-                out.write('REMARK   frame {0} found nothing\n'.format(frame))
-                out.write('HETATM    1  H   NIL X   1    {0}  1.00  0.00\n'.format(
-                    anchor or '%8.3f%8.3f%8.3f' % (0, 0, 0)))
-            out.write('ENDMDL\n')
-        out.write('END\n')
-
-    LOGGER.info('{0} frames merged into {1}{2}.'.format(
-        len(numbers), filename,
-        '' if not empty else ', {0} of them empty'.format(len(empty))))
-    return str(filename)
-
-
+    
+    return pores_all    
+    
+    
 def parseParameters(channels, **kwargs):
     """Extracts and returns the lengths, bottlenecks, and volumes of each
     channel in a given list of channels.
@@ -4309,7 +4144,7 @@ def getChannelParametersMultipleFrames(channels_all, trajectory=None, **kwargs):
 
     :arg trajectory: The trajectory the frames came from, if any. Only its
         presence is used, to name the files ``_frame<i>`` rather than
-         ``_model<i>``, matching :func:`getChannelResidueNamesMultipleFrames`.
+         ``_model<i>``, matching :func:`getChannelLiningInfoMultipleFrames`.
     :type trajectory: :class:`.Atomic`, :class:`.Ensemble`, or trajectory-like object
 
     :arg param_file_name: base name for the output parameter files. If provided,
@@ -4701,9 +4536,9 @@ def _vertexRadiiSource(atoms):
     if dry is None:
         dry = atoms
 
-    # Silent: getSurfaceCavityResidueNames has already measured the same atoms
-    # through _liningSource, which said whatever there was to say about them.
-    return _kdTree(dry), _atomRadii(dry, warn=False)
+    vdw = ChannelCalculator.getVdwRadii(
+        np.char.upper(np.asarray(dry.getElements(), dtype=str)))
+    return _kdTree(dry), vdw
 
 
 def _vertexRadii(points, source, k=24):
@@ -4740,6 +4575,74 @@ def _liningSource(atoms):
 
     return _kdTree(atoms), atoms.getCoords(), _atomRadii(atoms)
 
+def _liningContacts(source, points, radii, distA, deep=None):
+    """Every (probe, atom) pair whose surfaces come within *distA* of each other.
+
+    The criterion itself, stated once: an atom contacts a probe when
+    ``|x_p - x_a| - r_p - r_a <= distA``, the gap between the two surfaces. Why both
+    radii belong in it is argued at length in :func:`_liningResidues`, one of the two
+    callers.
+
+    Returns ``(probes, candidates, gaps)``, three arrays of equal length indexing
+    into *points* and into the *source* structure respectively. The pairing is what
+    separates this from :func:`_liningResidues`: that one collapses immediately to
+    whole residues and so can say neither *where along* an object a residue lines it
+    nor which of its atoms did the lining. The mmCIF export wants both per sphere - a
+    layer is a run of spheres sharing one lining set, and the schema's ``backbone``
+    flag asks which atom qualified - so the pairing is kept here and discarded by
+    whoever does not need it.
+
+    *source* is a :func:`_liningSource` bundle. *deep* is an optional dict, updated
+    in place with the atoms lying inside the route rather than beside it.
+
+    Empty arrays come back when nothing qualifies, so a caller tests ``len()`` once
+    instead of special-casing "no points at all" apart from "no contacts"."""
+
+    tree, coords, atom_radii = source
+    points = np.asarray(points, dtype=float)
+    radii = np.asarray(radii, dtype=float)
+
+    empty = (np.empty(0, dtype=int), np.empty(0, dtype=int), np.empty(0))
+    if len(points) == 0 or len(coords) == 0:
+        return empty
+
+    # A radius query and not a k-nearest one: a fixed k truncates wherever the
+    # wall is denser than the k it was chosen for, and the neighbours it drops
+    # are the far ones the criterion is deciding on. query_ball_point takes no
+    # per-neighbour radius, so the search is widened by the largest van der Waals
+    # radius present and the candidates are then held to their own.
+    hits = tree.query_ball_point(points,
+                                 radii + distA + float(atom_radii.max()))
+    counts = np.fromiter((len(hit) for hit in hits), dtype=int, count=len(hits))
+    if not counts.any():
+        return empty
+
+    # One flat (probe, candidate) list, so the exact gap is a single vectorized
+    # pass rather than a per-probe one; the widened query leaves few candidates
+    # to reject, and none to add.
+    candidates = np.fromiter((atom for hit in hits for atom in hit),
+                             dtype=int, count=int(counts.sum()))
+    probes = np.repeat(np.arange(len(points)), counts)
+    gaps = (np.linalg.norm(points[probes] - coords[candidates], axis=1)
+            - radii[probes] - atom_radii[candidates])
+
+    if deep is not None:
+        # A probe sphere is inscribed in the atoms the tessellation was built
+        # from, so against those it cannot overlap one. The spheres are read off
+        # the spline rather than off the Voronoi vertices, though, so a probe
+        # overshoots its inscribed sphere by a little and clips the wall. This
+        # floor sits well above that overshoot and far below a real overlap, so
+        # what it collects is only atoms the tessellation never saw.
+        inside = gaps < -0.5
+        for atom, gap in zip(candidates[inside].tolist(), gaps[inside].tolist()):
+            if gap < deep.get(atom, 0.0):
+                deep[atom] = gap
+
+    within = gaps <= distA
+    if not within.any():
+        return empty
+
+    return probes[within], candidates[within], gaps[within]
 
 def _liningResidues(atoms, source, points, radii, distA, deep=None):
     """Whole residues of *atoms* whose surface comes within *distA* of the probe's.
@@ -4917,33 +4820,6 @@ def _formatLiningResidues(residues, options):
                                             ':' + chid if chid else ''))
     return labels
 
-def _infoAsListOfStrings(info,key='Residues',sep=", "):
-
-    if not info:
-        return []
-      
-    def _joinList(lst,sep=sep ):
-        if not lst:
-            return ""
-        if len(lst) == 1:
-            return str(lst[0])
-        return sep.join(map(str, lst))
-
-    result = []
-    if isinstance(info,dict):
-        for channel in info:
-            lst = _joinList(info[channel][key])
-            result.append(f"{channel}: {lst}")
-        return result
-    
-    for conf in info:
-        tmp = []
-        for channel in conf:
-            lst = _joinList(conf[channel][key])
-            tmp.append(f"{channel}: {lst}")
-        result.append(tmp)
-    return result
-
 def _liningResindexMask(resindices, tree, points, radii, buffer=2.5):
     from itertools import chain
     if len(points) == 0:
@@ -5074,6 +4950,9 @@ def _saveLiningInfo(info,filepath,**kwargs):
 
     return filepath
 
+def _liningSource(atoms):
+    """Build the KD-tree/radius source used for lining calculations."""
+    return _kdTree(atoms), atoms.getCoords(), _atomRadii(atoms)
 
 def _liningContacts(source, points, radii, distA, deep=None):
     """
@@ -5202,51 +5081,6 @@ def _getLiningResidues(context):
         labels = np.char.add(labels,np.char.add(':', chains.astype(str)),)
     return np.unique(labels).tolist()
 
-def _getObjectResponseProfile(context):
-    kwargs = context['kwargs']
-    prs_matrix=kwargs.get('prs_matrix')
-    if not isinstance(prs_matrix,np.ndarray):
-        print('PRS Matrix must be provided')
-        return
-    if prs_matrix[0][0] == 1:
-        prs_matrix -= np.eye(len(prs_matrix))
-    mask = context['mask']
-    resindices_sub = context['resindices'][mask]
-    effect = prs_matrix[resindices_sub]
-    sense = prs_matrix.T[resindices_sub]
-    ec = np.mean(effect,axis=0)
-    sc = np.mean(sense,axis=0)
-    return {'Effecting':ec,'Sensing':sc}
-
-def _getSiteScores(context):
-    kwargs = context['kwargs']
-    mask = context['mask']
-    scores = kwargs.get('scores')
-    if isinstance(scores,dict):
-        subscores = {}
-        for key,values in scores.items():
-            subscores[key] = values[mask]
-        return subscores
-    subscores = scores[mask]
-    return subscores
-
-def _getSiteScoreStats(context):
-    subscores = _getSiteScores(context)
-    if subscores is None:
-        return {}
-    if isinstance(subscores, dict):
-        return {key:{'max': float(np.max(values)),
-                    'median': float(np.median(values))}
-                    for key, values in subscores.items()}
-
-    return {'max': float(np.max(subscores)),
-            'median': float(np.median(subscores))}
-
-def _getLiningResIndices(context):
-    mask = context['mask']
-    resindices = context['resindices'][mask]
-    unique_resindices = np.unique(resindices)
-    return unique_resindices
 
 def getObjectLiningInfo(atoms, objects, object_type='channel',
                         callbacks=None, **kwargs):
@@ -5313,7 +5147,7 @@ def getObjectLiningInfo(atoms, objects, object_type='channel',
 
     source = _liningSource(atoms)
     tree = source[0]
-    context['kwargs'] = kwargs
+
     context['source'] = source
     context['coords'] = source[1]
     context['vdw_radii'] = source[2]
@@ -5361,133 +5195,6 @@ def getObjectLiningInfo(atoms, objects, object_type='channel',
         LOGGER.info("Lining Info was saved to: {0}".format(output_file))
         
     return info
-
-def getObjectEssentialityScores(atoms, objects,stats_only=True, object_type='channel', **kwargs):
-    # ESSA is only scores protein residues and will not score ligands, nucleotides, waters, ions, or other objects
-    #Might update to account for cofactors,ribozymes, ect.
-    atoms = atoms.protein
-    info={}
-    z_scores = kwargs.pop('z_scores',None)
-    if not z_scores:
-        enm = kwargs.pop('enm','gnm')
-        n_modes = kwargs.pop('n_modes',10)
-        cutoff = kwargs.pop('cutoff',None)
-        lig = kwargs.pop('lig', None)
-        lowmem = kwargs.pop('lowmem',False)
-        essa=ESSA()
-        essa.setSystem(atoms,lig=lig)
-        essa.scanResidues(enm=enm,n_modes=n_modes,cutoff=cutoff,lowmem=lowmem)
-        z_scores = essa._zscore
-    if stats_only:
-        info = getObjectLiningInfo(atoms, 
-                            objects,
-                            object_type=object_type,
-                            callbacks={'SiteEssentiality':_getSiteScoreStats},
-                            scores=z_scores,
-                            **kwargs)
-    else:
-        info = getObjectLiningInfo(atoms, 
-                                    objects,
-                                    object_type=object_type,
-                                    callbacks={'SiteEssentiality':_getSiteScores},
-                                    scores=z_scores,
-                                    **kwargs)
-    return info
-
-def getObjectEffectivenessSensitivity(atoms, objects,prs_data = None,stats_only=True, object_type='channel', **kwargs):
-    
-
-    info={}
-    effectivness = None
-    sensitivity = None
-    if prs_data:
-        prs_matrix,effectiveness,sensitivity = prs_data
-    else:
-        enm = kwargs.pop('enm','anm')
-        n_modes = kwargs.pop('n_modes','all')
-        model, atomsca = calcENM(atoms, select='calpha',model=enm,n_modes=n_modes,trim='trim')
-        prs_matrix,effectiveness,sensitivity = calcPerturbResponse(model, atoms = atomsca)       
-        
-    if stats_only:
-        info = getObjectLiningInfo(atoms, 
-                            objects,
-                            object_type=object_type,
-                            callbacks={'PRScores':_getSiteScoreStats},
-                            scores={'effectiveness':effectiveness,
-                                   'sensitivity':sensitivity},
-                            **kwargs)
-    else:
-        info = getObjectLiningInfo(atoms, 
-                                    objects,
-                                    object_type=object_type,
-                                    callbacks={'PRScores':_getSiteScores},
-                                    scores={'effectiveness':effectiveness,
-                                   'sensitivity':sensitivity},
-                                    **kwargs)
-    return info
-
-
-def getObjectResidueNames(atoms, channels, **kwargs):
-    '''Provides the resnames and resid of residues that are forming the object(s). 
-    Residues are extracted based on distA, the clearance between the surface of
-    the FIL atoms (object atoms) and the van der Waals surface of the residue's
-    own atoms.
-    Results could be save as txt file by providing the `residues_file_name` parameter.
-    
-    :arg atoms: an Atomic object from which residues are selected 
-    :type atoms: :class:`.Atomic`
-
-    :arg objects: A list of objects. Each object has a method 
-        `getSplines()` that returns the centerline spline and radius spline of 
-        the object.
-    :type objects: list
-    
-    :arg object_type: Type of the object; "channel", "pore" or "link".
-        Default is "channel".
-    :type object_type: str
-
-    :arg distA: Residues reaching within this distance of the object's surface
-        are reported. It is a clearance between surfaces: the local probe radius
-        and the atom's van der Waals radius are both taken off, so a touching
-        atom sits at 0 and the reach is the same in a wide part of the object as
-        in a narrow one, and the same at a hydrogen as at a potassium ion.
-        Default is 1.5 [Ang]
-    :type distA: int, float
-    
-    :arg residues_file_name: The file with residues will be saved in a text 
-        file with the provided name. Use one word which will be added to 
-        '_Residues_All_{object_type}.txt' sufix. If further analysis will be 
-        performed with selectChannelBySelection() function, the preferable 
-        residues_file_name is PDB+chain for example: '1bbhA'.
-    :type residues_file_name: str  
-    
-    :arg one_letter_aa: Whether to apply 1-latter code to residue name
-        by defult is False. Only amino acids and nucleotides are translated;
-        ligands, cofactors and ions keep their residue name, so that the ion K
-        stays K rather than being read as a lysine.
-    :type one_letter_aa: bool
-
-    :arg include_water: Whether to list water molecules among the lining
-        residues. They are reported one entry per molecule, so a solvated
-        structure gives hundreds of them. Default is False.
-    :type include_water: bool
-
-    :arg include_chain: Whether to append the chain identifier to each residue,
-        as ``ASP108:A``. Default is True: without it a residue number does not
-        identify a residue, since an oligomer lines a channel with residues of
-        the same number from several chains. Pass False for the plain
-        ``ASP108`` labels written by earlier versions.
-    :type include_chain: bool  '''
-
-
-    info = getObjectLiningInfo(atoms,
-                                channels,
-                                object_type='channel',
-                                callbacks = {'Residues': _getLiningResidues},
-                                **kwargs )
-    
-    resnames = _infoAsListOfStrings(info)
-    return resnames
 
 def getObjectLiningInfoMultipleFrames(atoms, objects_all, trajectory=None, object_type='channel',callbacks={'Residues':_getLiningResidues}, **kwargs):
     '''Provides the resnames and resid of residues that are forming the object(s) in
@@ -5616,170 +5323,8 @@ def getObjectLiningInfoMultipleFrames(atoms, objects_all, trajectory=None, objec
 
     return info_all
 
-def getChannelResidueNames(atoms, channels, **kwargs):
-    '''Provides the resnames and resid of residues that are forming the pore(s). 
-    Residues are extracted based on distA which is the distance between FIL atoms 
-    (pore atoms) and protein residues.
-    Results could be save as txt file by providing the `residues_file_name` parameter.
-    
-    :arg atoms: an Atomic object from which residues are selected 
-    :type atoms: :class:`.Atomic`
 
-    :arg pores: A list of pore objects. Each pore has a method 
-        `getSplines()` that returns the centerline spline and radius spline of 
-        the pore.
-    :type pores: list
-
-    :arg distA: Residues reaching within this distance of the object's surface
-        are reported. The local probe radius is added to it, so the reach past
-        the surface is the same in a wide part of the object as in a narrow one.
-        The distance runs to the atom centre, so a touching atom sits at about
-        one van der Waals radius. Default is 2.5 [Ang]
-    :type distA: int, float
-    
-    :arg residues_file_name: The file with residues will be saved in a text 
-        file with the provided name. Use one word which will be added to 
-        '_Residues_All_pores.txt' sufix. If further analysis will be 
-        performed with selectChannelBySelection() function, the preferable 
-        residues_file_name is PDB+chain for example: '1bbhA'.
-    :type residues_file_name: str  
-    
-    :arg one_letter_aa: Whether to apply 1-latter code to residue name
-        by defult is False. Only amino acids and nucleotides are translated;
-        ligands, cofactors and ions keep their residue name, so that the ion K
-        stays K rather than being read as a lysine.
-    :type one_letter_aa: bool
-
-    :arg include_water: Whether to list water molecules among the lining
-        residues. They are reported one entry per molecule, so a solvated
-        structure gives hundreds of them. Default is False.
-    :type include_water: bool
-
-    :arg include_chain: Whether to append the chain identifier to each residue,
-        as ``ASP108:A``. Default is True: without it a residue number does not
-        identify a residue, since an oligomer lines a channel with residues of
-        the same number from several chains. Pass False for the plain
-        ``ASP108`` labels written by earlier versions.
-    :type include_chain: bool  '''
-
-    info = getObjectLiningInfo(atoms, 
-                                channels, 
-                                object_type='channel',
-                                callbacks={'Residues':_getLiningResidues},
-                                **kwargs)
-    resnames = _infoAsListOfStrings(info)
-    return resnames
-
-def getPoreResidueNames(atoms, pores, **kwargs):
-    '''Provides the resnames and resid of residues that are forming the pore(s). 
-    Residues are extracted based on distA which is the distance between FIL atoms 
-    (pore atoms) and protein residues.
-    Results could be save as txt file by providing the `residues_file_name` parameter.
-    
-    :arg atoms: an Atomic object from which residues are selected 
-    :type atoms: :class:`.Atomic`
-
-    :arg pores: A list of pore objects. Each pore has a method 
-        `getSplines()` that returns the centerline spline and radius spline of 
-        the pore.
-    :type pores: list
-
-    :arg distA: Residues reaching within this distance of the object's surface
-        are reported. The local probe radius is added to it, so the reach past
-        the surface is the same in a wide part of the object as in a narrow one.
-        The distance runs to the atom centre, so a touching atom sits at about
-        one van der Waals radius. Default is 2.5 [Ang]
-    :type distA: int, float
-    
-    :arg residues_file_name: The file with residues will be saved in a text 
-        file with the provided name. Use one word which will be added to 
-        '_Residues_All_pores.txt' sufix. If further analysis will be 
-        performed with selectChannelBySelection() function, the preferable 
-        residues_file_name is PDB+chain for example: '1bbhA'.
-    :type residues_file_name: str  
-    
-    :arg one_letter_aa: Whether to apply 1-latter code to residue name
-        by defult is False. Only amino acids and nucleotides are translated;
-        ligands, cofactors and ions keep their residue name, so that the ion K
-        stays K rather than being read as a lysine.
-    :type one_letter_aa: bool
-
-    :arg include_water: Whether to list water molecules among the lining
-        residues. They are reported one entry per molecule, so a solvated
-        structure gives hundreds of them. Default is False.
-    :type include_water: bool
-
-    :arg include_chain: Whether to append the chain identifier to each residue,
-        as ``ASP108:A``. Default is True: without it a residue number does not
-        identify a residue, since an oligomer lines a channel with residues of
-        the same number from several chains. Pass False for the plain
-        ``ASP108`` labels written by earlier versions.
-    :type include_chain: bool  '''
-
-    info = getObjectLiningInfo(atoms, 
-                                pores, 
-                                object_type='pore',
-                                callbacks={'Residues':_getLiningResidues},
-                                **kwargs)
-    resnames = _infoAsListOfStrings(info)
-    return resnames
-
-
-def getLinkResidueNames(atoms, links, **kwargs):
-    '''Provides the resnames and resid of residues that are forming the chamber
-    link(s) returned in ``details['links']`` by :func:`calcChannels`.
-    Residues are extracted based on distA which is the distance between FIL atoms
-    (link atoms) and protein residues. A link runs from one chamber into a
-    shallower one and is cut where it joins it, so the residues reported are
-    those lining the neck between the two sites, not a whole route to the solvent.
-    Results could be save as txt file by providing the `residues_file_name` parameter.
-
-    :arg atoms: an Atomic object from which residues are selected
-    :type atoms: :class:`.Atomic`
-
-    :arg links: A list of link objects. Each link has a method `getSplines()`
-        that returns the centerline spline and radius spline of the link.
-    :type links: list
-
-    :arg distA: Residues reaching within this distance of the cavity's surface
-        are reported. It is a clearance between surfaces: the inscribed radius at
-        each cavity vertex and the atom's van der Waals radius are both taken
-        off, so a touching atom sits at 0 and the reach is the same in a wide
-        cavity as in a narrow one, and the same at a hydrogen as at a potassium
-        ion. Default is 1.5 Å
-    :type distA: int, float
-
-    :arg residues_file_name: The file with residues will be saved in a text
-        file with the provided name. Use one word which will be added to
-        '_Residues_All_links.txt' sufix.
-    :type residues_file_name: str
-
-    :arg one_letter_aa: Whether to apply 1-latter code to residue name
-        by defult is False. Only amino acids and nucleotides are translated;
-        ligands, cofactors and ions keep their residue name, so that the ion K
-        stays K rather than being read as a lysine.
-    :type one_letter_aa: bool
-
-    :arg include_water: Whether to list water molecules among the lining
-        residues. They are reported one entry per molecule, so a solvated
-        structure gives hundreds of them. Default is False.
-    :type include_water: bool
-
-    :arg include_chain: Whether to append the chain identifier to each residue,
-        as ``ASP108:A``. Default is True: without it a residue number does not
-        identify a residue, since an oligomer lines a channel with residues of
-        the same number from several chains. Pass False for the plain
-        ``ASP108`` labels written by earlier versions.
-    :type include_chain: bool  '''
-    info = getObjectLiningInfo(atoms, 
-                                links, 
-                                object_type='link',
-                                callbacks={'Residues':_getLiningResidues},
-                                **kwargs)
-    resnames = _infoAsListOfStrings(info)
-    return resnames
-
-def getChannelResidueNamesMultipleFrames(atoms, channels, trajectory=None, **kwargs):
+def getChannelLiningInfo(atoms, channels, callbacks={'Residues':_getLiningResidues}, **kwargs):
     '''Provides the resnames and resid of residues that are forming the channel(s). 
     Residues are extracted based on distA which is the distance between FIL atoms 
     (channel atoms) and protein residues.
@@ -5824,17 +5369,11 @@ def getChannelResidueNamesMultipleFrames(atoms, channels, trajectory=None, **kwa
         the same number from several chains. Pass False for the plain
         ``ASP108`` labels written by earlier versions.
     :type include_chain: bool  '''
-    info = getObjectLiningInfoMultipleFrames(atoms,
-                                     channels, 
-                                     trajectory=trajectory, 
-                                    object_type='channel',
-                                      callbacks={'Residues':_getLiningResidues},
-                                        **kwargs)
-    
-    resnames = _infoAsListOfStrings(info)
-    return resnames
 
-def getPoreResidueNamesMultipleFrames(atoms, pores, trajectory=None, **kwargs):
+    return getObjectLiningInfo(atoms, channels, object_type='channel',callbacks=callbacks, **kwargs)
+
+
+def getPoreLiningInfo(atoms, pores, callbacks={'Residues':_getLiningResidues}, **kwargs):
     '''Provides the resnames and resid of residues that are forming the pore(s). 
     Residues are extracted based on distA which is the distance between FIL atoms 
     (pore atoms) and protein residues.
@@ -5879,18 +5418,160 @@ def getPoreResidueNamesMultipleFrames(atoms, pores, trajectory=None, **kwargs):
         the same number from several chains. Pass False for the plain
         ``ASP108`` labels written by earlier versions.
     :type include_chain: bool  '''
-    info = getObjectLiningInfoMultipleFrames(atoms,
-                                     pores, 
-                                     trajectory=trajectory, 
-                                    object_type='pore',
-                                      callbacks={'Residues':_getLiningResidues},
-                                        **kwargs)
+
+    return getObjectLiningInfo(atoms, pores, object_type='pore', callbacks=callbacks, **kwargs)
+
+
+def getLinkLiningInfo(atoms, links, callbacks={'Residues':_getLiningResidues}, **kwargs):
+    '''Provides the resnames and resid of residues that are forming the chamber
+    link(s) returned in ``details['links']`` by :func:`calcChannels`.
+    Residues are extracted based on distA which is the distance between FIL atoms
+    (link atoms) and protein residues. A link runs from one chamber into a
+    shallower one and is cut where it joins it, so the residues reported are
+    those lining the neck between the two sites, not a whole route to the solvent.
+    Results could be save as txt file by providing the `residues_file_name` parameter.
+
+    :arg atoms: an Atomic object from which residues are selected
+    :type atoms: :class:`.Atomic`
+
+    :arg links: A list of link objects. Each link has a method `getSplines()`
+        that returns the centerline spline and radius spline of the link.
+    :type links: list
+
+    :arg distA: Residues reaching within this distance of the object's surface
+        are reported. The local probe radius is added to it, so the reach past
+        the surface is the same in a wide part of the object as in a narrow one.
+        The distance runs to the atom centre, so a touching atom sits at about
+        one van der Waals radius. Default is 2.5 [Ang]
+    :type distA: int, float
+
+    :arg residues_file_name: The file with residues will be saved in a text
+        file with the provided name. Use one word which will be added to
+        '_Residues_All_links.txt' sufix.
+    :type residues_file_name: str
+
+    :arg one_letter_aa: Whether to apply 1-latter code to residue name
+        by defult is False. Only amino acids and nucleotides are translated;
+        ligands, cofactors and ions keep their residue name, so that the ion K
+        stays K rather than being read as a lysine.
+    :type one_letter_aa: bool
+
+    :arg include_water: Whether to list water molecules among the lining
+        residues. They are reported one entry per molecule, so a solvated
+        structure gives hundreds of them. Default is False.
+    :type include_water: bool
+
+    :arg include_chain: Whether to append the chain identifier to each residue,
+        as ``ASP108:A``. Default is True: without it a residue number does not
+        identify a residue, since an oligomer lines a channel with residues of
+        the same number from several chains. Pass False for the plain
+        ``ASP108`` labels written by earlier versions.
+    :type include_chain: bool  '''
+
+    return getObjectLiningInfo(atoms, links, object_type='link', callbacks=callbacks, **kwargs)
+
+
+def getChannelLiningInfoMultipleFrames(atoms, channels, trajectory=None, callbacks={'Residues':_getLiningResidues}, **kwargs):
+    '''Provides the resnames and resid of residues that are forming the channel(s). 
+    Residues are extracted based on distA which is the distance between FIL atoms 
+    (channel atoms) and protein residues.
+    Results could be save as txt file by providing the `residues_file_name` parameter.
     
-    resnames = _infoAsListOfStrings(info)
-    return resnames
+    :arg atoms: an Atomic object from which residues are selected 
+    :type atoms: :class:`.Atomic`
+
+    :arg channels: A list of channel objects. Each channel has a method 
+        `getSplines()` that returns the centerline spline and radius spline of 
+        the channel.
+    :type channels: list
+
+    :arg distA: Residues reaching within this distance of the object's surface
+        are reported. The local probe radius is added to it, so the reach past
+        the surface is the same in a wide part of the object as in a narrow one.
+        The distance runs to the atom centre, so a touching atom sits at about
+        one van der Waals radius. Default is 2.5 [Ang]
+    :type distA: int, float
+    
+    :arg residues_file_name: The file with residues will be saved in a text 
+        file with the provided name. Use one word which will be added to 
+        '_Residues_All_channels.txt' sufix. If further analysis will be 
+        performed with selectChannelBySelection() function, the preferable 
+        residues_file_name is PDB+chain for example: '1bbhA'.
+    :type residues_file_name: str  
+    
+    :arg one_letter_aa: Whether to apply 1-latter code to residue name
+        by defult is False. Only amino acids and nucleotides are translated;
+        ligands, cofactors and ions keep their residue name, so that the ion K
+        stays K rather than being read as a lysine.
+    :type one_letter_aa: bool
+
+    :arg include_water: Whether to list water molecules among the lining
+        residues. They are reported one entry per molecule, so a solvated
+        structure gives hundreds of them. Default is False.
+    :type include_water: bool
+
+    :arg include_chain: Whether to append the chain identifier to each residue,
+        as ``ASP108:A``. Default is True: without it a residue number does not
+        identify a residue, since an oligomer lines a channel with residues of
+        the same number from several chains. Pass False for the plain
+        ``ASP108`` labels written by earlier versions.
+    :type include_chain: bool  '''
+
+    return getObjectLiningInfoMultipleFrames(atoms, channels, trajectory=trajectory, 
+                                                object_type='channel', callbacks=callbacks, **kwargs)
 
 
-def getLinkResidueNamesMultipleFrames(atoms, links, trajectory=None, callbacks={'Residues':_getLiningResidues}, **kwargs):
+def getPoreLiningInfoMultipleFrames(atoms, pores, trajectory=None, callbacks={'Residues':_getLiningResidues}, **kwargs):
+    '''Provides the resnames and resid of residues that are forming the pore(s). 
+    Residues are extracted based on distA which is the distance between FIL atoms 
+    (pore atoms) and protein residues.
+    Results could be save as txt file by providing the `residues_file_name` parameter.
+    
+    :arg atoms: an Atomic object from which residues are selected 
+    :type atoms: :class:`.Atomic`
+
+    :arg pores: A list of pore objects. Each pore has a method 
+        `getSplines()` that returns the centerline spline and radius spline of 
+        the pore.
+    :type pores: list
+
+    :arg distA: Residues reaching within this distance of the object's surface
+        are reported. The local probe radius is added to it, so the reach past
+        the surface is the same in a wide part of the object as in a narrow one.
+        The distance runs to the atom centre, so a touching atom sits at about
+        one van der Waals radius. Default is 2.5 [Ang]
+    :type distA: int, float
+    
+    :arg residues_file_name: The file with residues will be saved in a text 
+        file with the provided name. Use one word which will be added to 
+        '_Residues_All_pores.txt' sufix. If further analysis will be 
+        performed with selectChannelBySelection() function, the preferable 
+        residues_file_name is PDB+chain for example: '1bbhA'.
+    :type residues_file_name: str  
+    
+    :arg one_letter_aa: Whether to apply 1-latter code to residue name
+        by defult is False. Only amino acids and nucleotides are translated;
+        ligands, cofactors and ions keep their residue name, so that the ion K
+        stays K rather than being read as a lysine.
+    :type one_letter_aa: bool
+
+    :arg include_water: Whether to list water molecules among the lining
+        residues. They are reported one entry per molecule, so a solvated
+        structure gives hundreds of them. Default is False.
+    :type include_water: bool
+
+    :arg include_chain: Whether to append the chain identifier to each residue,
+        as ``ASP108:A``. Default is True: without it a residue number does not
+        identify a residue, since an oligomer lines a channel with residues of
+        the same number from several chains. Pass False for the plain
+        ``ASP108`` labels written by earlier versions.
+    :type include_chain: bool  '''
+
+    return getObjectLiningInfoMultipleFrames(atoms, pores, trajectory=trajectory,
+                                                    object_type='pore', callbacks=callbacks, **kwargs)
+
+
+def getLinkLiningInfoMultipleFrames(atoms, links, trajectory=None, callbacks={'Residues':_getLiningResidues}, **kwargs):
     '''Provides the resnames and resid of residues that are forming the chamber
     link(s) in multiple frames/models.
 
@@ -5939,15 +5620,9 @@ def getLinkResidueNamesMultipleFrames(atoms, links, trajectory=None, callbacks={
         the same number from several chains. Pass False for the plain
         ``ASP108`` labels written by earlier versions.
     :type include_chain: bool  '''
-    info = getObjectLiningInfoMultipleFrames(atoms,
-                                     links, 
-                                     trajectory=trajectory, 
-                                    object_type='link',
-                                      callbacks={'Residues':_getLiningResidues},
-                                        **kwargs)
-    
-    resnames = _infoAsListOfStrings(info)
-    return resnames
+
+    return getObjectLiningInfoMultipleFrames(atoms, links, trajectory=trajectory,
+                                               object_type='link', callbacks=callbacks, **kwargs)
 
 
 def getSurfaceCavityResidueNames(atoms, cavities, surface, **kwargs):
@@ -7076,9 +6751,9 @@ def calcFrequentObjectResidues(residues_all, count_residue_names=False,
     """Count residues lining channels, pores, or surface cavities by chain.
 
     This function analyzes the output returned by:
-    - getChannelResidueNamesMultipleFrames()
-    - getPoreResidueNamesMultipleFrames()
-    - getSurfaceCavityResidueNamesMultipleFrames()
+    - getChannelLiningInfoMultipleFrames()
+    - getPoreLiningInfoMultipleFrames()
+    - getSurfaceCavityLiningInfoMultipleFrames()
 
     :arg residues_all: Residue lists returned by one of the multiple-frame
         residue-reporting functions. The expected input is a list of frame/model
@@ -7102,7 +6777,7 @@ def calcFrequentObjectResidues(residues_all, count_residue_names=False,
     :type output_file_name: str or None
 
     Examples:
-    residues_all = getChannelResidueNamesMultipleFrames(protein, channels_all, trajectory=dcd)
+    residues_all = getChannelLiningInfoMultipleFrames(protein, channels_all, trajectory=dcd)
 
     counts = countObjectResiduesByChain(residues_all)
 
@@ -8207,6 +7882,7 @@ def _writeCifCategories(out, rows, notes=()):
              rows['layer_residue'])
 
     out.write('#\n')
+
 
 
 class Channel:
@@ -10831,16 +10507,6 @@ class ChannelCalculator:
         for a site lying wholly under a wide opening, and failing that the anchor's own
         depth, which always leaves at least the anchor itself.
 
-        The anchor itself competes whatever its depth: the floor bounds where the seed
-        may move to, not whether the tetrahedron at the point counts, so the seed is
-        only ever moved to a tetrahedron wider than the anchor. Held to the floor, an
-        anchor lying just under it would drop out and be traded for the widest
-        tetrahedron clearing it, however much narrower that one is. And the anchor's
-        depth moves with the probe: a smaller `inner_radius` opens mouths nearer the
-        point, so the anchor crosses the floor as the probe shrinks, the seed jumps
-        with it, and a site could read as sealed at one `inner_radius` and open at
-        the next.
-
         `search_radius` <= 0 restores the plain nearest-vertex seed.
 
         :returns: dict of the seed and anchor properties (`seed`, `anchor`, and their
@@ -10916,12 +10582,8 @@ class ChannelCalculator:
             if len(eligible):
                 break
 
-        # The anchor competes whatever its depth (see above), so the seed only ever
-        # moves to a wider tetrahedron; `eligible` still counts only what cleared
-        # the floor, which is what the report states. The anchor comes first (BFS
-        # order), so a tie goes to it.
-        candidates = eligible if eligible[0] == 0 else np.concatenate(([0], eligible))
-        best = int(reach[candidates[int(np.argmax(radii[candidates]))]])
+        # The anchor comes first (BFS order), so a tie goes to it where it qualifies.
+        best = int(reach[eligible[int(np.argmax(radii[eligible]))]])
 
         return report(best, len(reachable), len(eligible), floor)
 
@@ -11231,17 +10893,10 @@ class ChannelCalculator:
                         info['anchor_depth'], info['eligible'], info['floor'],
                         info['searched'], float(search_radius)))
         elif search_radius and search_radius > 0:
-            if info['anchor_depth'] < info['floor']:
-                LOGGER.info("    kept although shallower than {0:.1f} Å: already as wide "
-                    "as any of the {1} tetrahedra at least that deep among the {2} "
-                    "reachable within {3:.1f} Å."
-                    .format(info['floor'], info['eligible'], info['searched'],
-                            float(search_radius)))
-            else:
-                LOGGER.info("    already the widest of the {0} tetrahedra at least {1:.1f} Å "
-                    "deep among the {2} reachable within {3:.1f} Å."
-                    .format(info['eligible'], info['floor'], info['searched'],
-                            float(search_radius)))
+            LOGGER.info("    already the widest of the {0} tetrahedra at least {1:.1f} Å "
+                "deep among the {2} reachable within {3:.1f} Å."
+                .format(info['eligible'], info['floor'], info['searched'],
+                        float(search_radius)))
 
 
 
@@ -11253,2142 +10908,11 @@ class ChannelCalculator:
                 tetra for tetra in cavity.tetrahedra
                 if cavity.tetrahedra_depths.get(tetra, np.inf) <= max_depth])
 
-def prepareChannelRecords(channels, atoms=None, trajectory=None, voxelize=False,
-                          max_proc=None, mp_context=None, **kwargs):
-    """
-    Build a flat list of ChannelRecords (one per channel, frame-major order).
-
-    Parameters
-    ----------
-    channels : list[list[Channel]]
-        One list of channels per frame.
-    atoms, trajectory :
-        If both are given, lining residues are computed and stored on each
-        record (record.lining_residues).
-    voxelize : bool
-        If True, every record is voxelized onto a shared lattice
-        (common global_origin + voxel_size).
-    max_proc : int or None
-        Worker processes for record building. None -> cpu_count // 2.
-    mp_context : str or None
-        Multiprocessing context, e.g. 'fork' or 'spawn'.
-    **kwargs :
-        ClusterCalculator options (voxel_size, pad_factor, h, angle_deg, q,
-        n_samples, alpha, beta) are consumed here; everything else is
-        forwarded to getObjectLiningInfoMultipleFrames.
-
-    Returns
-    -------
-    records : list[ClusterCalculator.ChannelRecord]
-    """
-    import multiprocessing
-
-    if channels is None or len(channels) == 0:
-        return []
-
-    # Split kwargs between the calculator and the lining-residue routine
-    calc_keys = ('voxel_size', 'pad_factor', 'h', 'angle_deg', 'q',
-                 'n_samples', 'alpha', 'beta')
-    calc_kwargs = {k: kwargs.pop(k) for k in calc_keys if k in kwargs}
-    clustercalc = ClusterCalculator(**calc_kwargs)
-
-    # Flatten channels, tracking which frame each belongs to
-    flat_channels = []
-    frame_ids = []
-    for frame_id, channel_group in enumerate(channels):
-        flat_channels.extend(channel_group)
-        frame_ids.extend([frame_id] * len(channel_group))
-    n = len(flat_channels)
-    if n == 0:
-        return []
-
-    # Multiprocessing setup
-    if max_proc is None:
-        max_proc = max(1, multiprocessing.cpu_count() // 2)
-    max_proc = max(1, int(max_proc))
-    ctx = multiprocessing.get_context(mp_context) if mp_context else multiprocessing.get_context()
-
-    # A shared lattice origin is required before any voxelization
-    if voxelize:
-        raw_bboxes = [clustercalc.channelBoundBox(c) for c in flat_channels]
-        clustercalc.global_origin = np.min([bb[0] for bb in raw_bboxes], axis=0)
-        LOGGER.info("All Bounding Boxes Built")
-
-    # Build records (optionally voxelized)
-    if max_proc == 1 or n == 1:
-        records = [clustercalc._buildChannelRecord(ch, fid, voxelize=voxelize)
-                   for fid, ch in zip(frame_ids, flat_channels)]
-    else:
-        tasks = [(ch, fid, voxelize) for fid, ch in zip(frame_ids, flat_channels)]
-        chunksize = max(1, n // (max_proc * 4))
-        with ctx.Pool(processes=max_proc) as pool:
-            records = pool.map(clustercalc._buildChannelRecordWorker, tasks,
-                               chunksize=chunksize)
-        # Splines may not survive pickling; rebuild if missing
-        for record in records:
-            if not record.channel.getSplines()[0]:
-                record.channel._buildSplines()
-    LOGGER.info("All Channels Voxelized" if voxelize else "All Channel Records Built")
-
-    # Optional lining residues
-    if atoms is not None and trajectory is not None:
-        resinds = getObjectLiningInfoMultipleFrames(
-            atoms, channels, trajectory,
-            callbacks={'ResIndices': _getLiningResIndices},
-            **kwargs)
-
-        # Each frame's result is a dict keyed by whatever ID the routine uses
-        # (not the Channel objects), so iterate the dict's own keys,
-        # exactly as the original code did.
-        residue_sets = [frame_info[key]['ResIndices']
-                        for frame_info in resinds
-                        for key in frame_info]
-
-        if len(residue_sets) != len(records):
-            raise ValueError(
-                f"Lining info returned {len(residue_sets)} channels but "
-                f"{len(records)} records were built; cannot match them up.")
-
-        for residue_set, record in zip(residue_sets, records):
-            record.lining_residues = residue_set
-        LOGGER.info("Lining residues assigned")
-
-    return records
-
-
-def buildCenterlineDistanceMatrix(channels=None, records=None, h=10, n_samples=5, angle_deg=5.0,
-                                    q=1.0,dtype=np.float32,block_size=None,max_proc=None,
-                                    normalize_radii=True,clip_distance=True,**kwargs ):
-    import multiprocessing
-    from multiprocessing import Pool
-    clustercalc = ClusterCalculator(h=h, angle_deg=angle_deg, q=q, n_samples=n_samples)
-    # Accept either nested channels or a flat list of ChannelRecords.
-    if records is not None and channels is not None:
-        raise ValueError("Pass either channels or records, not both.")
-
-    if records is None:
-        if channels is None or len(channels) == 0:
-            return None
-
-        # Flatten the list of lists of channels into records.
-        records = []
-
-        for conf_id, channel_group in enumerate(channels):
-            for channel in channel_group:
-                if channel.cost is None:
-                    raise ValueError("Channel.cost is None -- required to rank channels.")
-
-                if channel.centerline_spline is None:
-                    raise ValueError("Channel.centerline_spline is None -- call " 
-                                        "channel._buildSplines() before clustering.")
-
-                records.append(clustercalc._buildChannelRecord(channel=channel, conformation_id=conf_id))
-
-    else:
-        # Materialize the input in case records is an iterator.
-        records = list(records)
-
-        if not records:
-            return None
-
-        if not np.all(isinstance(record, clustercalc.ChannelRecord) for record in records):
-            raise TypeError("records must contain only ChannelRecord instances.")
-
-    if not records:
-        return None
-
-    S = clustercalc.computeAverageStart(records)
-
-    clustercalc.computeRepresentativePoints(records, S, h=h)
-
-    n = len(records)
-    if n == 0:
-        return np.empty((0, 0), dtype=dtype)
-
-    h = min(len(r.rep_points) for r in records)
-    weights = clustercalc.computeDistanceWeights(h, q).astype(np.float32)
-
-    shell_data = clustercalc._prepareAllShells(records, h)   # built ONCE, shared by every block/worker
-    centroids,radii_means = clustercalc._prepareChannelCentroids(records)
-
-
-    if block_size is None:
-        block_size = n
-    block_size = max(1, int(block_size))
-
-    D = np.empty((n, n), dtype=dtype)
-    blocks = [(start, min(start + block_size, n)) for start in range(0, n, block_size)]
-
-    if max_proc is None:
-        max_proc = max(1, multiprocessing.cpu_count() // 2)
-    mp_context = kwargs.get('mp_context')
-    if mp_context is None:
-        ctx = multiprocessing.get_context()
-    else:
-        ctx = multiprocessing.get_context(mp_context)
-
-    if max_proc == 1:
-        clustercalc._initDistanceWorker(shell_data, weights, n, centroids,radii_means,normalize_radii,clip_distance)
-        for block in blocks:
-            start, end, Db = clustercalc._distanceBlock(block)
-            D[start:end] = Db
-    else:
-        with ctx.Pool(processes=max_proc,initializer= clustercalc._initDistanceWorker,
-                        initargs=(shell_data, weights, n,centroids,radii_means,normalize_radii,clip_distance)) as pool:
-            for start, end, block in pool.imap( clustercalc._distanceBlock, blocks):
-                D[start:end] = block
-
-
-    D = np.minimum(D, D.T)          # enforce exact numerical symmetry
-    np.fill_diagonal(D, 0.0)
-    return D, records
-
-
-def buildVoxelOverlapDistanceMatrix(channels=None, records=None, voxel_size=0.25,
-                                    max_proc=1, mp_context=None, pad_factor=1.02,
-                                    interframe_only=False, **kwargs):
-    """
-    Calculate pairwise spatial distance (1 - weighted voxel overlap score)
-    between channels.
-
-    Every channel is voxelized exactly once onto a shared lattice (common
-    origin + voxel pitch). Pairwise overlap is then integer-indexed slicing
-    and a bitwise AND between cached masks.
-
-    Parameters
-    ----------
-    channels : list[list[Channel]] or None
-        One list of channels per frame. Mutually exclusive with `records`.
-    records : list[ChannelRecord] or None
-        Pre-built records (e.g. from prepareChannelRecords). Frame membership
-        is taken from each record's `conformation_id`. Unvoxelized records
-        are voxelized here onto a shared lattice.
-    voxel_size : float
-        Voxel pitch. Ignored when records are already voxelized (their
-        lattice is used instead).
-    max_proc : int or None
-        Worker processes for the per-channel voxelization step.
-        None -> cpu_count // 2.
-    mp_context : str or None
-        Multiprocessing context, e.g. 'fork'.
-    pad_factor : float
-        Passed to ClusterCalculator.
-    interframe_only : bool
-        If True, pairs within the same frame are never compared and their
-        entries in D are NaN. Cross-frame pairs that do not overlap are
-        1.0 (max distance), never NaN.
-
-    Returns
-    -------
-    D : ndarray (n, n)
-        Symmetric distance matrix. Diagonal is 0.
-    records : list[ChannelRecord]
-        Voxelized records, in the same order as the rows/columns of D.
-    """
-    import multiprocessing
-
-    if records is not None and channels is not None:
-        raise ValueError("Pass either channels or records, not both.")
-
-    alpha = kwargs.pop('alpha', 0.5)
-    beta = kwargs.pop('beta', 2.0)
-    clustercalc = ClusterCalculator(voxel_size=voxel_size, pad_factor=pad_factor,
-                                    alpha=alpha, beta=beta)
-
-    if max_proc is None:
-        max_proc = max(1, multiprocessing.cpu_count() // 2)
-    max_proc = max(1, int(max_proc))
-    ctx = (multiprocessing.get_context(mp_context) if mp_context
-           else multiprocessing.get_context())
-
-    # ------------------------------------------------------------------
-    # Obtain voxelized records on a shared lattice
-    # ------------------------------------------------------------------
-    if records is None:
-        if channels is None or len(channels) == 0:
-            return None
-        records = prepareChannelRecords(channels, voxelize=True,
-                                        max_proc=max_proc, mp_context=mp_context,
-                                        voxel_size=voxel_size, pad_factor=pad_factor,
-                                        alpha=alpha, beta=beta)
-    else:
-        records = list(records)
-        if not records:
-            return None
-        if not all(isinstance(rec, ClusterCalculator.ChannelRecord) for rec in records):
-            raise TypeError("records must contain only ChannelRecord instances.")
-
-        if all(rec.voxelized for rec in records):
-            # Adopt the lattice the records were voxelized on, and make sure
-            # they all share it - masks are only comparable on one lattice.
-            ref = records[0].calculator
-            for rec in records:
-                cal = rec.calculator
-                if (not np.isclose(cal.voxel_size, ref.voxel_size) or
-                        not np.allclose(cal.global_origin, ref.global_origin)):
-                    raise ValueError("Records were voxelized on different lattices "
-                                     "(voxel_size / global_origin differ).")
-            clustercalc.voxel_size = ref.voxel_size
-            clustercalc.global_origin = ref.global_origin
-        else:
-            # Any unvoxelized record -> (re)voxelize everything on one lattice.
-            clustercalc.global_origin = np.min([rec.bbox[0] for rec in records], axis=0)
-            for rec in records:
-                rec.calculator = clustercalc
-
-            if max_proc == 1 or len(records) == 1:
-                for rec in records:
-                    rec._prepareVoxels()
-            else:
-                chunksize = max(1, len(records) // (max_proc * 4))
-                with ctx.Pool(processes=max_proc) as pool:
-                    records = pool.map(clustercalc._prepareVoxelsWorker, records,
-                                       chunksize=chunksize)
-                for rec in records:
-                    if not rec.channel.getSplines()[0]:
-                        rec.channel._buildSplines()
-            LOGGER.info("All Records Voxelized")
-
-    # ------------------------------------------------------------------
-    # Frame bookkeeping derived from conformation_id
-    # ------------------------------------------------------------------
-    n = len(records)
-    conf_ids = np.array([rec.conformation_id for rec in records])
-    unique_frames = np.unique(conf_ids)
-    num_frames = len(unique_frames)
-    # Index arrays (not slices) so record order doesn't have to be frame-sorted
-    frame_indices = [np.nonzero(conf_ids == f)[0] for f in unique_frames]
-
-    # ------------------------------------------------------------------
-    # Initialise D
-    # ------------------------------------------------------------------
-    D = np.ones((n, n), dtype=float)
-    if interframe_only:
-        for idx in frame_indices:
-            D[np.ix_(idx, idx)] = np.nan      # same-frame = "not computed"
-    np.fill_diagonal(D, 0.0)
-
-    bboxes_mn = np.array([rec.bbox[0] for rec in records])
-    bboxes_mx = np.array([rec.bbox[1] for rec in records])
-
-    # ------------------------------------------------------------------
-    # Candidate pairs from bounding-box overlap
-    # ------------------------------------------------------------------
-    tasks = []
-    for a in range(num_frames):
-        for b in range(a, num_frames):
-            if a == b and interframe_only:
-                continue
-            idx_a, idx_b = frame_indices[a], frame_indices[b]
-
-            overlap = clustercalc._pairwiseBBoxOverlap(
-                bboxes_mn[idx_a], bboxes_mx[idx_a],
-                bboxes_mn[idx_b], bboxes_mx[idx_b])
-            overlap = np.asarray(overlap, dtype=bool)
-
-            if a == b:
-                overlap &= np.triu(np.ones(overlap.shape, dtype=bool), k=1)
-
-            local_i, local_j = np.nonzero(overlap)
-            for i, j in zip(idx_a[local_i].tolist(), idx_b[local_j].tolist()):
-                tasks.append((i, j, records[i], records[j]))
-
-    scores = [clustercalc._scoreVoxelOverlapPrepared(task) for task in tasks]
-    LOGGER.info("All Channel Overlaps Scored")
-
-    for i, j, score in scores:
-        D[i, j] = score
-        D[j, i] = score
-
-    return D, records
-
-
-def buildLiningSequenceDistanceMatrix(atoms,channels=None,trajectory=None,records=None,**kwargs):
-    if records is not None and channels is not None:
-        raise ValueError("Pass either channels or records, not both.")
-    if channels and not trajectory:
-        raise ValueError("If channels is passed, trajectory must also be passed") 
-    
-    alpha = kwargs.pop('alpha',0.5)
-    beta = kwargs.pop('beta',2.0)
-    clustercalc = ClusterCalculator(alpha=alpha,beta=beta)
-    n_resi= len(np.unique(atoms.getResindices()))
-    if records is None:
-        if channels is None or len(channels) == 0:
-            return None
-        records = []
-        for  conf_id, channel_group in enumerate(channels):
-            for channel in channel_group:
-                records.append(clustercalc._buildChannelRecord(channel=channel, conformation_id=conf_id))
-
-        resinds = getObjectLiningInfoMultipleFrames(atoms,channels,trajectory,
-                                                    callbacks={'ResIndices':_getLiningResIndices},
-                                                    **kwargs)
-        residue_sets = [channel_group[channel]['ResIndices'] for channel_group in resinds for channel in channel_group]
-        for residue_set, record in zip(residue_sets,records):
-            record.lining_residues = residue_set
-
-        packed = np.array([clustercalc._pack(residue_set,n_resi) for residue_set in residue_sets])
-        return clustercalc._TverskyDistanceMatrix(packed), records
-    
-    packed = np.array([clustercalc._pack(rec.lining_residues,n_resi) for rec in records])
-    return clustercalc._TverskyDistanceMatrix(packed), records
-
-
-
-def clusterChannels(distance_matrix, method, records, **kwargs):
-    """
-    Cluster channels/samples from a precomputed distance matrix.
-
-    Parameters
-    ----------
-    distance_matrix : array-like of shape (n_samples, n_samples)
-        A square, precomputed pairwise distance matrix.
-    method : str
-        Clustering algorithm to use. One of {'HDBSCAN', 'DBSCAN', 'agglomerative'}.
-    **kwargs
-        sparse : bool, default False
-            If True, convert distance_matrix to a scipy CSR sparse matrix
-            before fitting (only meaningful for methods that support sparse
-            precomputed distances, e.g. DBSCAN/HDBSCAN).
-        Any other keyword arguments are forwarded directly to the
-        corresponding scikit-learn estimator's constructor. Common examples:
-            - HDBSCAN: min_cluster_size, min_samples, cluster_selection_epsilon
-            - DBSCAN: eps, min_samples
-            - agglomerative: n_clusters, linkage, distance_threshold
-
-    Returns
-    -------
-    labels : numpy.ndarray of shape (n_samples,)
-        Cluster label for each sample. Returned for 'HDBSCAN' and 'DBSCAN'.
-    (labels, linkage_matrix) : tuple
-        Returned for 'agglomerative'. linkage_matrix follows the format
-        expected by scipy.cluster.hierarchy.dendrogram: columns are
-        [child_1, child_2, distance, sample_count].
-
-    Raises
-    ------
-    ValueError
-        If distance_matrix is not square, or method is not recognized.
-    ImportError
-        If the required scikit-learn clustering class is unavailable.
-    """
-    labels = []
-    clustercalc = ClusterCalculator()
-    from scipy.sparse import csr_matrix
-    distance_matrix = np.asarray(distance_matrix) if not kwargs.get('sparse', False) else distance_matrix
-
-    try:
-        n_rows, n_cols = distance_matrix.shape
-    except (AttributeError, ValueError) as exc:
-        raise ValueError("distance_matrix must be a 2D array-like object") from exc
-
-    if n_rows != n_cols:
-        raise ValueError(
-            f"distance_matrix must be square (n_samples x n_samples); got shape {distance_matrix.shape}"
-        )
-    n = n_rows
-
-    valid_methods = {'HDBSCAN', 'DBSCAN', 'agglomerative'}
-    if method not in valid_methods:
-        raise ValueError(f"Unknown method '{method}'. Expected one of {sorted(valid_methods)}")
-        
-    sparse = kwargs.pop('sparse', False)
-    if sparse:
-        distance_matrix = csr_matrix(distance_matrix)
-    else:
-        distance_matrix = np.asarray(distance_matrix,copy=True)
-    if method == 'HDBSCAN':
-        try:
-            from sklearn.cluster import HDBSCAN
-        except ImportError as exc:
-            raise ImportError(
-                "HDBSCAN requires scikit-learn>=1.3. Install/upgrade with `pip install -U scikit-learn`."
-            ) from exc
-
-        # Sensible defaults; anything the caller passes in kwargs overrides these.
-        kwargs.setdefault('metric', 'precomputed')
-        try:
-            hdb = HDBSCAN(**kwargs)
-            hdb.fit(distance_matrix)
-        except Exception as exc:
-            raise RuntimeError(f"HDBSCAN fitting failed: {exc}") from exc
-        labels = hdb.labels_
-
-    elif method == 'DBSCAN':
-        try:
-            from sklearn.cluster import DBSCAN
-        except ImportError as exc:
-            raise ImportError("DBSCAN requires scikit-learn. Install with `pip install -U scikit-learn`.") from exc
-
-        kwargs.setdefault('metric', 'precomputed')
-        kwargs.setdefault('eps', 0.5)
-        kwargs.setdefault('min_samples', 5)
-        try:
-            db = DBSCAN(**kwargs)
-            db.fit(distance_matrix)
-        except Exception as exc:
-            raise RuntimeError(f"DBSCAN fitting failed: {exc}") from exc
-        labels = db.labels_
-
-    elif method == 'agglomerative':
-        try:
-            from sklearn.cluster import AgglomerativeClustering
-        except ImportError as exc:
-            raise ImportError("AgglomerativeClustering requires scikit-learn. Install with `pip install -U scikit-learn`.") from exc
-            
-        distance_threshold = kwargs.pop('distance_threshold', 0.4) #0.4 assumes dist scale 0-1
-        linkage = kwargs.pop('linkage', 'average')
-
-        # distance_threshold and n_clusters are mutually exclusive in sklearn;
-        # if the caller supplied a distance_threshold, n_clusters must be None.
-        if 'n_clusters' in kwargs and kwargs['n_clusters'] is not None:
-            distance_threshold = None
-        else:
-            n_clusters=None
-        try:
-            agg = AgglomerativeClustering(
-                distance_threshold=distance_threshold,
-                n_clusters=n_clusters,
-                metric='precomputed',
-                linkage=linkage,
-                compute_distances=True,
-                **kwargs,
-            )
-            agg.fit(distance_matrix)
-        except Exception as exc:
-            raise RuntimeError(f"AgglomerativeClustering fitting failed: {exc}") from exc
-        labels = agg.labels_
-
-    for rec,label in zip(records,labels):
-        rec.cluter_ids.append(label)
-    p = np.argsort(labels)
-    sorted_recs = records[p]
-    unique, counts = np.unique(labels, return_counts=True)
-    k=len(unique)
-    clusters = np.empty(k,dtype=clustercalc.Cluster)
-    start = 0
-    for label, count in zip(range(k),unique,counts):
-        end = start + count
-        recs = sorted_recs[start:end]
-        clusters[k] = clustercalc.Cluster(label,recs)
-        clusters[k]._calcInternalDistanceMatrix(distance_matrix,labels)
-        clusters[k]._calcClusterStats(labels)
-        start = end
-    clustering = clustercalc.ClusteringRecords(clusters,labels,distance_matrix)
-    return labels, clustering 
-
-def renameChannelFilesWithClusterLabels(channels, labels, output_path,
-                                        stem='channels', ext='pqr',
-                                        dry_run=False):
-    """Tag calcChannelsMultipleFrames()'s per-channel files with a cluster id.
-
-    Appends "_clid<label>" to the name of every channel file
-    calcChannelsMultipleFrames() already wrote to disk, so a downstream viewer
-    (see vis_channels_traj.py) can group and colour channels by cluster
-    identity across frames instead of by their per-frame rank. Rank is not a
-    stable identity: cavity detection runs independently per frame, so "rank 2"
-    in frame 50 is not necessarily the same physical channel as "rank 2" in
-    frame 0, whereas a cluster label computed across all frames at once is.
-
-    Files must have been generated from a run with separate=True.
-    mmCIF is not supported and raises immediately - every
-    channel of a frame lives inside ONE shared .cif file there (one row per
-    channel in the _sb_ncbr_channel_profile loop, rather than one file per
-    channel), so there is no single file to rename per channel. Tagging a
-    channel's cluster in that format means writing the label into the CIF's
-    own fields, not renaming a file, and is a different piece of code to the
-    one this function is.
-
-    :arg channels: per-frame channel lists, in the same frame-major order
-        calcChannelsMultipleFrames() returns as `channels_all` - channels[i] is
-        the list of channel objects found in frame i, each carrying the
-        `.origin` attribute calcChannels() sets (the search-site index behind
-        the "sp<n>" tag in its filenames, or None where the run was not tagged
-        by site - see below).
-    :type channels: list of lists
-
-    :arg labels: one cluster id per channel, flattened in exactly the same
-        frame-major, then within-frame order `channels` itself iterates in -
-        i.e. labels[n] must be the cluster id of the n-th channel walking
-        `channels` as `for i in range(len(channels)): for j in
-        range(len(channels[i])): ...`. Length must equal the total channel
-        count across all frames; a length mismatch is the single most common
-        way this silently renames the wrong files, so it is checked up front
-        rather than discovered partway through a rename pass.
-
-        A label of -1 (HDBSCAN's noise convention) is tagged "noise" rather
-        than "-1", both to read clearly in a directory listing and because
-        vis_channels_traj.py already special-cases the literal string "noise"
-        to group it separately, in grey, switched off by default.
-    :type labels: sequence of int
-
-    :arg output_path: the SAME value passed as `output_path` to the original
-        calcChannelsMultipleFrames() run, so the files this function looks for
-        match the files that run actually wrote. Two forms are accepted:
-
-        - An existing directory (e.g. "vmt_channels/"): files are assumed to
-          sit directly inside it, named
-          "<stem><frame>[_sp<origin>]_chl<index>.<ext>". `stem` defaults to
-          "channels", the label calcChannelsMultipleFrames() hard-codes
-          internally (`_frameOutputPath(output_path, j0, "channels")`);
-          override `stem=` only if that call used a different label.
-        - A directory-and-stem prefix with no separator between them (e.g.
-          "frames/frame", giving files like "frames/frame12_chl0.pqr"),
-          mirroring calcChannelsMultipleFrames() being invoked with its own
-          `output_path` already carrying the intended stem. Detected
-          automatically: if `output_path` is not itself an existing
-          directory, its final path component becomes the stem and its
-          parent becomes the directory, and `stem=` is ignored.
-
-        Renaming happens after the files already exist, so "is it a
-        directory" is an unambiguous test at this point even though it would
-        not have been before the original run had written anything.
-    :type output_path: str or os.PathLike
-
-    :arg stem: filename stem used when `output_path` is a bare directory (see
-        above); ignored when `output_path` already carries its own stem.
-        Default "channels".
-    :type stem: str
-
-    :arg ext: extension of the files actually written - "pqr" (default) or
-        "pdb", matching whatever the original run's output_path used. "cif"
-        is rejected; see above.
-    :type ext: str
-
-    :arg dry_run: if True, print each (old name -> new name) pair without
-        calling os.rename, so a wrong `stem`/`output_path` guess is caught
-        before anything on disk is touched. Recommended on the first run
-        against any given directory. Default False.
-    :type dry_run: bool
-
-    :returns: number of files renamed (or, with dry_run=True, that would be).
-    :rtype: int
-
-    :raises ValueError: if `ext` is "cif" or otherwise unsupported, or if
-        `len(labels)` does not match the total channel count in `channels`.
-    """
-    from pathlib import Path
-    ext = str(ext).lower().lstrip('.')
-    if ext == 'cif':
-        raise ValueError(
-            "renameChannelFilesWithClusterLabels() does not support mmCIF "
-            "output: every channel of a frame lives in one shared .cif file "
-            "there, so there is no single per-channel file to rename. Tag "
-            "clusters into the CIF's own fields instead, or re-run "
-            "calcChannelsMultipleFrames() with output_format='pqr' (default) "
-            "or a .pdb output_path, and separate=True.")
-    if ext not in ('pqr', 'pdb'):
-        raise ValueError("ext must be 'pqr' or 'pdb', got {0!r}.".format(ext))
-
-    total_channels = sum(len(frame_channels) for frame_channels in channels)
-    if len(labels) != total_channels:
-        raise ValueError(
-            "labels has {0} entries but channels holds {1} channels in "
-            "total - they must line up 1:1, flattened frame by frame, "
-            "channel index by channel index, in the order channels itself "
-            "iterates.".format(len(labels), total_channels))
-
-    output_path = Path(output_path)
-    if output_path.is_dir():
-        directory = output_path
-        # `stem` keeps its default/passed-in value
-    else:
-        directory, stem = output_path.parent, output_path.name
-
-    index = 0
-    renamed = 0
-    for frame_index, frame_channels in enumerate(channels):
-        for channel_index, channel in enumerate(frame_channels):
-            origin = getattr(channel, 'origin', None)
-            # Matches _numberedPath's own rule: a single-site run tags
-            # nothing with "sp<n>" at all, rather than writing "spNone".
-            site_tag = '' if origin is None else '_sp{0}'.format(origin)
-            name = '{0}{1}{2}_chl{3}'.format(
-                stem, frame_index, site_tag, channel_index)
-
-            label = int(labels[index])
-            tag = 'noise' if label == -1 else str(label)
-            index += 1
-
-            old_path = directory / '{0}.{1}'.format(name, ext)
-            new_path = directory / '{0}_clid{1}.{2}'.format(name, tag, ext)
-
-            if not old_path.exists():
-                # A filtered-out channel, a different run's naming, or a
-                # mismatched output_path/stem guess -- reported and skipped
-                # rather than raised, so one bad assumption doesn't abort a
-                # rename pass that is otherwise correct for every other file.
-                _warn("Expected channel file not found, skipped: {0}"
-                     .format(old_path))
-                continue
-
-            if dry_run:
-                print("{0} -> {1}".format(old_path.name, new_path.name))
-            else:
-                os.rename(str(old_path), str(new_path))
-            renamed += 1
-
-    LOGGER.info("{0}{1} channel file(s) with cluster labels{2}.".format(
-        'Would rename ' if dry_run else 'Renamed ', renamed,
-        ' (dry run)' if dry_run else ''))
-
-    return renamed
-
-def computeBootstrapStability(D, method, sub_size=0.80, n_bootstrap=100,
-                                reference="full",random_state=123,**kwargs):
-    """
-    Evaluate clustering stability using bootstrap/subsampled datasets.
-    Parameters
-    ----------
-    D : ndarray, shape (n_samples, n_samples)
-        Precomputed distance matrix.
-    method : str
-        Clustering method passed to clusterChannels().
-    sub_size : float, default=0.80
-        Fraction of samples to retain in each replicate.
-    n_bootstrap : int, default=5
-        Number of subsampling replicates.
-    reference : {"full", "first"}
-        "full": compare each subsample to clustering of all samples.
-        "first": compare each subsample to the first subsample.
-    random_state : int, default=123
-        Random seed.
-    **kwargs
-        Additional arguments passed to clusterChannels().
-    Returns
-    -------
-    stability : dict
-        Contains ARI scores, mean, standard deviation, and
-        the full-data reference labels if applicable.
-    """
-    if not checkAndImport('sklearn'):
-        raise ImportError('To run computeBootstrapStability, please install scikit-learn')
-    
-    from sklearn.metrics import adjusted_rand_score
-
-    D = np.asarray(D)
-
-    if D.ndim != 2 or D.shape[0] != D.shape[1]:
-        raise ValueError("D must be a square distance matrix.")
-
-    n = len(D)
-
-    if not 0 < sub_size <= 1:
-        raise ValueError("sub_size must be in (0, 1].")
-
-    if reference not in {"full", "first"}:
-        raise ValueError("reference must be 'full' or 'first'.")
-
-    rng = np.random.default_rng(random_state)
-    n_keep = max(2, int(round(sub_size * n)))
-    # Reference clustering
-    if reference == "full":
-        labels_ref = np.asarray(
-            clusterChannels(D, method, **kwargs))
-        if len(labels_ref) != n:
-            raise ValueError("clusterChannels returned invalid labels.")
-    else:
-        labels_ref = None
-
-    scores = []
-    for i in range(n_bootstrap):
-        # Random subsample without replacement
-        keep = rng.choice(n, size=n_keep, replace=False)
-        keep.sort()
-        D_sub = D[np.ix_(keep, keep)]
-        # Recluster
-        labels_sub = np.asarray(
-            clusterChannels(D_sub, method, **kwargs))
-
-        if len(labels_sub) != len(keep):
-            raise ValueError("clusterChannels returned invalid labels.")
-
-        # First replicate becomes reference
-        if reference == "first" and labels_ref is None:
-            labels_ref = labels_sub.copy()
-            keep_ref = keep.copy()
-            continue
-
-        if reference == "full":
-            labels_compare = labels_ref[keep]
-
-        else:
-            # Compare only channels present in both subsets
-            common, idx_sub, idx_ref = np.intersect1d(
-                keep, keep_ref, return_indices=True)
-
-            if len(common) < 2:
-                continue
-
-            labels_compare = labels_ref[idx_ref]
-            labels_sub = labels_sub[idx_sub]
-
-        # ARI ignores the numerical names of clusters
-        ari = adjusted_rand_score(labels_compare,labels_sub,)
-        scores.append(ari)
-    scores = np.asarray(scores)
-
-    return {"scores": scores,
-            "mean": np.mean(scores),
-            "std": np.std(scores),
-            "median": np.median(scores),
-            "reference_labels": labels_ref}
-
-def clusteringDistanceStats(D, labels):
-    labels = np.asarray(labels)
-    valid = labels >= 0
-    labels = labels[valid]
-    D = D[np.ix_(valid, valid)]
-    clusters = np.unique(labels)
-    within = []
-    between = []
-    for i, c1 in enumerate(clusters):
-        idx1 = labels == c1
-        # within-cluster
-        if idx1.sum() > 1:
-            vals = D[np.ix_(idx1, idx1)]
-            within.append(vals[np.triu_indices_from(vals, k=1)])
-        # between-cluster
-        for c2 in clusters[i+1:]:
-            idx2 = labels == c2
-            between.append(D[np.ix_(idx1, idx2)].ravel())
-    within = np.concatenate(within) if within else np.array([])
-    between = np.concatenate(between) if between else np.array([])
-    return {"mean_within": np.mean(within),
-            "median_within": np.median(within),
-            "mean_between": np.mean(between),
-            "median_between": np.median(between),
-            "separation_ratio":np.mean(between) / np.mean(within)}
-
-def compareClusterings(labels1,labels2):
-    if not checkAndImport('sklearn'):
-        raise ImportError('To run computeBootstrapStability, please install scikit-learn')
-    if not checkAndImport('sklearn'):
-        errorMsg = 'To run getClusterStats, please install scikit-learn'
-        raise ImportError(errorMsg)
-    from sklearn.metrics import adjusted_rand_score,adjusted_mutual_info_score
-    
-    return {"ARI": adjusted_rand_score(labels1, labels2),
-            "AMI": adjusted_mutual_info_score(labels1, labels2)}
-
-class ClusterCalculator:
-    
-    def __init__(self, atoms=None, voxel_size=0.25,pad_factor=1.02,h=10,angle_deg=5.0,
-                q=1.0,n_samples=5, global_origin=None,alpha=0.5,beta=2.0):
-        
-        self.atoms = atoms
-        self.voxel_size=voxel_size
-        self.pad_factor=pad_factor
-        self.h=h
-        self.angle_deg=angle_deg
-        self.q=q
-        self.n_samples=n_samples
-        self.global_origin = global_origin
-        self.alpha = alpha
-        self.beta = beta
-        POPCOUNT_TABLE = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
-        self.POPCOUNT_TABLE = POPCOUNT_TABLE
-
-    class ChannelRecord:
-        """Cached geometry for one channel"""
-
-        def __init__(self,calculator, channel, conformation_id, lining_residues = None, rep_points=None,
-                    rep_radii=None, centerline_points=None,centerline_radii=None,
-                    tree=None,bbox=None,mask=None,offset=None,dims=None,volume=None,
-                    endpoint=None,r_T=None,kept=True,cluster_ids=[],shell_weights=None):
-
-            if not channel.getSplines()[0]:
-                channel._buildSplines()
-            self.channel = channel
-            self.conformation_id = conformation_id
-            self.calculator = calculator
-
-            #calculated later
-            self.centerline_points = centerline_points
-            self.centerline_radii = centerline_radii
-            self.dims=dims
-            self.bbox = bbox
-            self.tree = tree
-            self.mask = mask
-            self.offset = offset
-            self.volume = volume
-            self.lining_residues = lining_residues
-
-            #calculated during center sampling 
-            self.rep_points = rep_points
-            self.rep_radii = rep_radii
-            self.endpoint = endpoint
-            self.r_T = r_T
-            self.kept = kept
-            self.cluster_ids = cluster_ids
-            self.shell_weights = shell_weights
-            self.voxelized = False
-            self.__postInit__()
-
-
-        def __postInit__(self):
-            """Prepare geometry that does not depend on the Metric Calcs"""
-            self.centerline_points, self.centerline_radii = _sampleObjectSpheres(self.channel,
-                                                 self.calculator.n_samples)
-            self.tree = _kdTree(self.centerline_points)
-            self.bbox = self.calculator.channelBoundBox(self.channel)                       
-
-        def _prepareVoxels(self):
-            """Prepare Voxel Representation Geometry"""
-            global_origin = self.calculator.global_origin
-            voxel_size= self.calculator.voxel_size
-            mn, mx = self.bbox
-            i0 = np.floor((mn - global_origin) / voxel_size).astype(int)
-            i1 = np.ceil((mx - global_origin) / voxel_size).astype(int)
-            self.offset = i0
-            self.dims = np.maximum(i1 - i0, 1)
-            grid_mn = global_origin + i0 * voxel_size
-            self.mask = self.calculator.voxelizeChannelAligned(self.centerline_points,
-                                                            self.centerline_radii,
-                                                            self.tree,
-                                                            self.dims,
-                                                            grid_mn)
-        
-            self.volume = (np.count_nonzero(self.mask) * self.calculator.voxel_size ** 3)
-            self.voxelized = True
-                
-        @property
-        def bbox_min(self):
-            return self.bbox[0]
-
-        @property
-        def bbox_max(self):
-            return self.bbox[1]
-
-        @property
-        def n_shells(self):
-            if self.rep_points is None:
-                return 0
-            return len(self.rep_points)
-
-        @property
-        def n_voxels(self):
-            if self.mask is None:
-                return 0
-            return int(np.count_nonzero(self.mask))
-
-    def _buildChannelRecord(self,channel, conformation_id, voxelize=False):
-        """Top-level (picklable) worker for parallel channel voxelization."""
-        if voxelize:
-            record = self.ChannelRecord(self, channel, conformation_id)
-            record._prepareVoxels()
-            return record
-        return self.ChannelRecord(self, channel, conformation_id)
-
-    def _prepareVoxelsWorker(self,record):
-        record._prepareVoxels()
-        return record
-
-    def _buildChannelRecordWorker(self,args):
-        channel, conformation_id, voxelize = args
-        return self._buildChannelRecord(channel, conformation_id, voxelize=voxelize)
-    
-
-    class Cluster:
-        def __init__(self, label, records, details=None, depth=0):
-            self.label = label
-            self.records = records
-            self.details = details if details is not None else {}   # was a shared mutable default
-            self.conformation_ids = [rec.conformation_id for rec in records]
-            self.approximated = None
-            self.soft_assigned = None
-            self.size = len(records)
-            self.depth = depth
-            self.persistence = None
-            self.mediod = None              # GLOBAL index into the fitted subsample
-            self.mean_pairwise_distance = None
-            self.density = None
-            self.max_nearest_neighbor_distance = None
-            self.internal_distance_matrix = None
-            self.mean_probability = None    # only if hdbscan
-            self.voxelized_graph = None
-            self.graph_occupancy = None
-            self.subclusters = None #ClusterCalculator.ClusteringRecords()
-            # set by ClusteringRecords.fit(); refer to the ORIGINAL subsample,
-            # so they stay valid after extendCluster()
-            self.rep_idx = None             # subsample indices of representatives
-            self.rep_threshold = None       # acceptance radius computed on the reps
-
-
-        @property
-        def _threshold(self):
-            if self.rep_threshold is not None:
-                return self.rep_threshold
-            return max(self.mean_pairwise_distance, self.max_nearest_neighbor_distance)
-
-        def _resetStats(self):
-            self.persistence = None
-            self.mediod = None
-            self.mean_pairwise_distance = None
-            self.density = None
-            self.max_nearest_neighbor_distance = None
-            self.internal_distance_matrix = None
-            self.mean_probability = None
-            self.voxelized_graph = None
-            self.graph_occupancy = None
-
-        def extendCluster(self,records):
-            records = list(records)
-            self.records = list(self.records) + records
-            self.conformation_ids.extend(rec.conformation_id for rec in records)
-            self.approximated = True
-            self.size = len(self.records)
-            self._resetStats()
-
-
-        def _calcInternalDistanceMatrix(self,distance_matrix,labels):
-            D = np.asarray(distance_matrix)
-            labels = np.asarray(labels)
-            idx = np.flatnonzero(labels == self.label)
-            if len(idx) == 0:
-                raise ValueError("Cluster {0} does not exist.".format(self.label))
-            Dc = D[np.ix_(idx, idx)]
-            self.internal_distance_matrix = Dc
-        
-        def _calcPersistance(self,num_conformations):
-            self.persistance = self.size/num_conformations
-
-        def _calcClusterStats(self,labels):
-            labels = np.asarray(labels)
-            idx = np.flatnonzero(labels == self.label)
-            n = len(idx)            # not self.size: size grows after extendCluster()
-            Dc = self.internal_distance_matrix
-            self.mediod = int(idx[np.argmin(Dc.sum(axis=1))])
-            if n > 1:
-                upper = Dc[np.triu_indices(n, k=1)]
-
-                mean_pairwise_distance = upper.mean()
-            else:
-                mean_pairwise_distance = 0.0
-            self.mean_pairwise_distance = mean_pairwise_distance
-            # For every point, find its closest OTHER point in the cluster.
-            # Then take the largest of those nearest-neighbor distances.
-            if n > 1:
-                Dc_no_diag = Dc.copy()
-                np.fill_diagonal(Dc_no_diag, np.inf)
-                nearest_neighbor_distances = Dc_no_diag.min(axis=1)
-                self.max_nearest_neighbor_distance = nearest_neighbor_distances.max()
-            else:
-                self.max_nearest_neighbor_distance = 0.0
-            # Here density is defined as inverse mean pairwise distance.
-            # Higher = more compact.
-            if n > 1 and mean_pairwise_distance > 0:
-                self.density = 1.0 / mean_pairwise_distance
-            else:
-                self.density = np.inf
-
-
-
-        # def _buildVoxelizedGraph(self):
-
-        #     self.graph = graph
-
-        
-        # def _calcOccupancies(self):
-        #     if not self.voxelized_graph:
-        #         self._buildVoxelizedGraph()
-        #     self.graph_occupancy = occupancy
-
-
-    class ClusteringRecords:
-        def __init__(self,clusters, labels, distance_matrix, levels=[0]):
-            self.clusters = clusters
-            self.labels = labels
-            self.distance_matrix = distance_matrix
-            self.num_clusters = len(clusters)
-            self.levels = levels
-            self.between_distances = None
-            self.approximated = False
-            self._by_label = {}
-            self._n_sub = len(self.labels)
-            self._fitted = False
-
-        def getClusterByLabel(self,label):
-            for cluster in self.clusters:
-                if cluster.label == label:
-                    return cluster
-            LOGGER.warn('No Cluster With Label {0} found'.format(label))
-            return None
-
-        def fit(self, max_reps_per_cluster=500, random_state=123, keep_internal=True):
-            """Choose representatives and an acceptance threshold per cluster,
-            using only the (n_sub, n_sub) distance matrix.
-
-            Cluster-level stats (medoid etc.) are computed here if the Cluster
-            doesn't have them yet. Representatives are a random subset that
-            always includes the medoid.
-            """
-            D = np.asarray(self.distance_matrix, dtype=float)
-            if D.ndim != 2 or D.shape[0] != D.shape[1]:
-                raise ValueError("distance_matrix must be square (n_sub, n_sub)")
-            if D.shape[0] != len(self.labels):
-                raise ValueError("distance_matrix size must match len(labels)")
-
-            rng = np.random.default_rng(random_state)
-            self._n_sub = D.shape[0]
-            self._by_label = {}
-
-            for cluster in self.clusters:
-                member_idx = np.flatnonzero(self.labels == cluster.label)
-                if len(member_idx) == 0:
-                    LOGGER.warn('Cluster {0} has no members in labels'.format(cluster.label))
-                    continue
-
-                if cluster.internal_distance_matrix is None or cluster.mediod is None:
-                    cluster._calcInternalDistanceMatrix(D, self.labels)
-                    cluster._calcClusterStats(self.labels)
-
-                n = len(member_idx)
-                # cluster.mediod is a global index -> position within this cluster
-                medoid_local = int(np.flatnonzero(member_idx == cluster.mediod)[0])
-
-                if max_reps_per_cluster is not None and n > max_reps_per_cluster:
-                    others = np.delete(np.arange(n), medoid_local)
-                    pick = rng.choice(others, size=max_reps_per_cluster - 1, replace=False)
-                    rep_local = np.concatenate([[medoid_local], pick])
-                else:
-                    rep_local = np.arange(n)
-                rep_idx = member_idx[rep_local]
-
-                if len(rep_idx) > 1:
-                    D_rep = D[np.ix_(rep_idx, rep_idx)]          # fancy indexing copies
-                    mean_pw = float(D_rep[np.triu_indices(len(rep_idx), k=1)].mean())
-                    np.fill_diagonal(D_rep, np.inf)
-                    max_nn = float(D_rep.min(axis=1).max())
-                else:
-                    mean_pw, max_nn = 0.0, 0.0
-
-                cluster.rep_idx = rep_idx
-                cluster.rep_threshold = max(mean_pw, max_nn)
-                cluster.approximated = len(rep_idx) < n
-                if not keep_internal:
-                    cluster.internal_distance_matrix = None
-
-                self._by_label[int(cluster.label)] = cluster
-
-            self.num_clusters = len(self._by_label)
-            self.approximated = True
-            self._fitted = True
-            return self
-
-        def _checkFitted(self):
-            if not self._fitted or not self._by_label:
-                raise RuntimeError("call fit() first")
-
-        @staticmethod
-        def _batches(new_to_sub, n_new, batch_size):
-            for start in range(0, n_new, batch_size):
-                end = min(start + batch_size, n_new)
-                block = new_to_sub(start, end) if callable(new_to_sub) else new_to_sub[start:end]
-                yield start, end, np.asarray(block, dtype=float)
-
-        def _nNew(self, new_to_sub, n_new):
-            if callable(new_to_sub):
-                if n_new is None:
-                    raise ValueError("n_new is required when new_to_sub is a callable")
-                return n_new
-            return len(new_to_sub)
-
-        def _distToClusters(self, block, labels_list):
-            """(b, n_sub) block -> (b, k): min distance to each cluster's reps."""
-            if block.shape[1] != self._n_sub:
-                raise ValueError(f"expected {self._n_sub} columns (one per subsample "
-                                 f"point), got {block.shape[1]}")
-            return np.stack([block[:, self._by_label[l].rep_idx].min(axis=1)
-                             for l in labels_list], axis=1)
-
-        def assign(self, new_to_sub, n_new=None, batch_size=2000, strict=True,
-                   slack=1.0, atol=1e-9):
-            """Hard-assign new points; -1 = unassigned. See earlier docstring."""
-            self._checkFitted()
-            n = self._nNew(new_to_sub, n_new)
-            labels_list = list(self._by_label)
-            lbl_arr = np.array(labels_list)
-            thr = np.array([self._by_label[l]._threshold for l in labels_list]) * slack
-            thr = np.where(thr == 0.0, atol, thr)
-
-            out = np.full(n, -1, dtype=int)
-            for start, end, block in self._batches(new_to_sub, n, batch_size):
-                d = self._distToClusters(block, labels_list)
-                best_j = d.argmin(axis=1)
-                best_d = d[np.arange(len(d)), best_j]
-                accept = np.ones(len(d), bool) if not strict else best_d <= thr[best_j]
-                out[start:end] = np.where(accept, lbl_arr[best_j], -1)
-            return out
-
-        def softAssign(self, new_to_sub, n_new=None, max_distance=None,
-                       bandwidth=None, top_k=None, batch_size=2000):
-            """Soft-assign borderline points. Returns (labels_list, probs)."""
-            self._checkFitted()
-            n = self._nNew(new_to_sub, n_new)
-            labels_list = list(self._by_label)
-            k = len(labels_list)
-
-            thr = np.array([self._by_label[l]._threshold for l in labels_list])
-            thr = thr[thr > 0]
-            if max_distance is None:
-                max_distance = float(2.0 * thr.max()) if thr.size else 1.0
-            if bandwidth is None:
-                bandwidth = max(float(np.median(thr)) if thr.size else 1.0, 1e-6)
-
-            probs = np.zeros((n, k))
-            for start, end, block in self._batches(new_to_sub, n, batch_size):
-                d = self._distToClusters(block, labels_list)
-                w = np.where(d <= max_distance, np.exp(-d / bandwidth), 0.0)
-
-                if top_k is not None and top_k < k:
-                    keep = np.argpartition(-w, top_k - 1, axis=1)[:, :top_k]
-                    mask = np.zeros_like(w, dtype=bool)
-                    np.put_along_axis(mask, keep, True, axis=1)
-                    w = np.where(mask, w, 0.0)
-
-                s = w.sum(axis=1, keepdims=True)
-                probs[start:end] = np.divide(w, s, out=np.zeros_like(w), where=s > 0)
-            return labels_list, probs
-
-        def extend(self, new_records, new_to_sub, batch_size=2000, strict=True, slack=1.0):
-            """Hard-assign new ChannelRecords and add them to their Clusters via
-            Cluster.extendCluster(). Returns the labels (-1 = left unassigned)."""
-            new_records = list(new_records)
-            labels = self.assign(new_to_sub, n_new=len(new_records),
-                                 batch_size=batch_size, strict=strict, slack=slack)
-            for lbl in np.unique(labels):
-                if lbl == -1:
-                    continue
-                members = [new_records[i] for i in np.flatnonzero(labels == lbl)]
-                self._by_label[int(lbl)].extendCluster(members)
-            return labels
-
-
-
-
-##### Bounding Box Functions #####
-    def channelBoundBox(self,channel):
-        """
-        Axis-aligned bbox padded by the channel's maximum radius.
-        """
-        r = channel.radii.max() * self.pad_factor
-        mn = channel.centers.min(axis=0) - r
-        mx = channel.centers.max(axis=0) + r
-        return mn, mx
-
-    def _pairwiseBBoxOverlap(self,mn_a, mx_a, mn_b, mx_b):
-        """
-        Vectorized bbox-overlap test between two GROUPS of bboxes.
-
-        mn_a, mx_a : (m, 3) arrays - bbox corners for group A
-        mn_b, mx_b : (k, 3) arrays - bbox corners for group B
-
-        Returns an (m, k) boolean matrix, computed with a single pair of
-        broadcasted min/max calls instead of a python-level double loop.
-        Kept as its own small block (m, k, 3) rather than doing this across
-        *all* n channels at once, so memory stays O(frame_size^2) instead
-        of O(n^2).
-        """
-        lo = np.maximum(mn_a[:, None, :], mn_b[None, :, :])   # (m, k, 3)
-        hi = np.minimum(mx_a[:, None, :], mx_b[None, :, :])   # (m, k, 3)
-
-        return np.all(hi > lo, axis=-1)                       # (m, k)
-##### Bounding Box Functions #####
-
-
-##### Functions Related to the Channel Lining Residue Pipeline #####
-    def _pack(self,residue_set, n_residues):
-        arr = np.zeros(n_residues, dtype=np.uint8)
-        arr[list(residue_set)] = 1
-        return np.packbits(arr)
-    
-    def _TverskyDistanceMatrix(self, packed):
-        """ 
-        alpha weighs the impact of the minimum and maximum relative complement
-        beta weighs the overall effect of difference between two sets
-        alpha = 0.5, beta = 2.0 reproduces the jaccard index
-        alpha = 0.5, beta=0.5 reproduces the dice index
-        """
-        alpha = self.alpha
-        beta = self.beta
-        n = packed.shape[0]
-        dist = np.zeros((n, n), dtype=float)
-        for i in range(n):
-            intersection = self.POPCOUNT_TABLE[packed[i] & packed].sum(axis=1)
-            x_minus_y = self.POPCOUNT_TABLE[packed[i] & ~packed].sum(axis=1)
-            y_minus_x = self.POPCOUNT_TABLE[~packed[i] & packed].sum(axis=1)
-            a = np.minimum(x_minus_y, y_minus_x)
-            b = np.maximum(x_minus_y, y_minus_x)
-            denominator = intersection + beta * (alpha * a + (1 - alpha) * b)
-            dist[i] = 1.0 - intersection / denominator
-
-        return dist
-##### Functions Related to the Channel Lining Residue Pipeline #####
-
-
-##### Functions Related to the Voxelization Pipeline #####
-    def _segmentProject(self,p, a, b):
-        """
-        Project points p onto segments a -> b.
-
-        Returns
-        -------
-        dist2 : ndarray
-            Squared distance from each point to the segment.
-        t : ndarray
-            Segment parameter in [0, 1].
-        """
-        ab = b - a
-
-        denom = np.einsum('ij,ij->i', ab, ab)
-        denom = np.maximum(denom, 1e-12)
-
-        t = np.einsum('ij,ij->i', p - a, ab) / denom
-        t = np.clip(t, 0.0, 1.0)
-        closest = a + t[:, None] * ab
-        diff = p - closest
-        dist2 = np.einsum('ij,ij->i', diff, diff)
-        return dist2, t
-
-
-    def _pointsInsideMask(self,query_points, points, radii, tree, refine=True):
-        """
-        Vectorized point-in-channel test, given an already-built tree.
-
-        Single tree.query() call over all query_points at once (uses
-        scipy's multi-threaded query), followed by the same vectorized
-        segment-refinement used previously - no per-point or per-segment
-        Python loop.
-        """
-        d_nn, idx = tree.query(query_points, k=1, workers=-1)
-
-        if not refine or len(points) < 3:
-            return d_nn <= radii[idx]
-
-        n = len(points)
-
-        idx_prev = np.clip(idx - 1, 0, n - 1)
-        idx_next = np.clip(idx + 1, 0, n - 1)
-
-        dist2_a, t_a = self._segmentProject(query_points,
-                                        points[idx_prev],
-                                        points[idx])
-
-        dist2_b, t_b =  self._segmentProject(query_points,
-                                        points[idx],
-                                        points[idx_next])
-
-        use_a = dist2_a < dist2_b
-        r_a = (radii[idx_prev] + t_a * (radii[idx] - radii[idx_prev]))
-        r_b = (radii[idx] + t_b * (radii[idx_next] - radii[idx]))
-        radius = np.where(use_a, r_a, r_b)
-        dist2 = np.where(use_a, dist2_a, dist2_b)
-
-        return dist2 <= radius * radius
-
-
-    def _insideChannelMask(self,query_points, prepared, refine=True):
-        """
-        Determine which query points are inside a channel, via KD-tree.
-
-        Kept for callers that need point-in-channel tests for arbitrary,
-        unstructured query points (e.g. lining queries). Not used by the
-        volume/intersection pipeline below.
-        """
-        query_points = np.asarray(query_points, dtype=float)
-
-        return self._pointsInsideMask(query_points,
-                                    prepared.centerline_points,
-                                    prepared.centerline_radii,
-                                    prepared.tree,
-                                    refine=refine)
-
-
-    def _gridPoints(self,dims, grid_mn):
-        """
-        World-space coordinates of every voxel center in a `dims`-shaped
-        grid whose first voxel center sits at `grid_mn`, built as a single
-        vectorized meshgrid (no per-voxel or per-segment Python loop).
-        """
-        voxel_size=self.voxel_size
-
-        xs = grid_mn[0] + (np.arange(dims[0]) + 0.5) * voxel_size
-        ys = grid_mn[1] + (np.arange(dims[1]) + 0.5) * voxel_size
-        zs = grid_mn[2] + (np.arange(dims[2]) + 0.5) * voxel_size
-
-        X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
-
-        return np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=-1)
-
-    def voxelizeChannelAligned(self,centers, radii, tree, dims, grid_mn):
-        voxel_size=self.voxel_size
-        if len(centers) < 2:
-            return np.zeros(dims, dtype=bool)
-
-        # Vectorized per-segment padded index boxes
-        a, b = centers[:-1], centers[1:]
-        r = np.maximum(radii[:-1], radii[1:])
-
-        seg_mn = np.minimum(a, b) - r[:, None]
-        seg_mx = np.maximum(a, b) + r[:, None]
-
-        i0 = np.clip(np.floor((seg_mn - grid_mn) / voxel_size).astype(int), 0, dims)
-        i1 = np.clip(np.ceil((seg_mx - grid_mn) / voxel_size).astype(int), 0, dims)
-
-        # Union of segment windows -> candidate voxels only
-        active = np.zeros(dims, dtype=bool)
-        for k in range(len(a)):
-            if np.any(i1[k] <= i0[k]):
-                continue
-            active[i0[k, 0]:i1[k, 0], i0[k, 1]:i1[k, 1], i0[k, 2]:i1[k, 2]] = True
-
-        idx = np.argwhere(active)
-        if len(idx) == 0:
-            return np.zeros(dims, dtype=bool)
-
-        pts = grid_mn + (idx + 0.5) * voxel_size
-
-        # One batched query, but only over the reduced candidate set.
-        inside = self._pointsInsideMask(pts, centers, radii, tree, refine=True)
-
-        grid = np.zeros(dims, dtype=bool)
-        grid[idx[:, 0], idx[:, 1], idx[:, 2]] = inside
-        return grid   
-
-    def _maskVoxelOverlapVolume(self,prepared_a, prepared_b):
-        """
-        Overlap volume of two already-voxelized, lattice-aligned channels.
-
-        Pure integer index arithmetic to find the overlapping voxel-index
-        range, then a slice + bitwise AND + count_nonzero. No rasterization,
-        no floating point, no search of any kind happens here.
-        """
-        
-        start = np.maximum(prepared_a.offset, prepared_b.offset)
-        end = np.minimum(prepared_a.offset + prepared_a.dims,
-                            prepared_b.offset + prepared_b.dims)
-
-        if np.any(end <= start):
-            return 0.0
-
-        sa0 = start - prepared_a.offset
-        sa1 = end - prepared_a.offset
-        sb0 = start - prepared_b.offset
-        sb1 = end - prepared_b.offset
-
-        sub_a = prepared_a.mask[sa0[0]:sa1[0], sa0[1]:sa1[1], sa0[2]:sa1[2]]
-        sub_b = prepared_b.mask[sb0[0]:sb1[0], sb0[1]:sb1[1], sb0[2]:sb1[2]]
-
-        intersection = np.count_nonzero(sub_a & sub_b)
-        a_minus_b =  np.count_nonzero(sub_a & ~sub_b)
-        b_minus_a =  np.count_nonzero(~sub_a & sub_b)
-        a = np.minimum(a_minus_b, b_minus_a)
-        b = np.maximum(a_minus_b, b_minus_a)
-        u3 = self.voxel_size ** 3
-        return intersection*u3, a*u3,b*u3
-
-
-    def _scoreVoxelOverlapPrepared(self,task):
-        """
-        Calculate Jaccard distance for one channel pair, from cached masks.
-        """
-        i, j, prepared_a, prepared_b= task
-        alpha = self.alpha
-        beta = self.beta
-        inter, a , b = self._maskVoxelOverlapVolume(prepared_a, prepared_b)
-        denominator = inter + beta * (alpha * a + (1 - alpha) * b)
-        if denominator <= 0:
-            return i, j, 1.0
-        score = 1.0 - inter / denominator
-        return i, j, score
-
-
-##### Functions Related to the Voxelization Pipeline #####
-
-
-##### Functions Related to the Center Sampling Pipeline #####
-
-    def _unit(self, v):
-        n = np.linalg.norm(v)
-        return v / n if n > 1e-12 else v
-
-
-    def computeAverageStart(self,records):
-        """S_average = centroid of starting vertices from all conformations."""
-        starts = np.array([np.asarray(r.channel.centers[0], dtype=float) for r in records])
-        return starts.mean(axis=0)
-
-
-    def computeRepresentativePoints(self,records,S,h=10):
-        """
-        Compute centerline representative points for all ChannelRecords.
-        For each channel and each radial shell, multiple continuous centerline
-        segments are allowed. Results are stored directly on each ChannelRecord:
-
-            record.rep_points[i]  -> (n_segments, 3)
-            record.rep_radii[i]   -> (n_segments,)
-
-        The representative point of each segment is an arc-length-weighted
-        centroid, and the representative radius is an arc-length-weighted
-        mean radius.
-
-        Parameters
-        ----------
-        records : list[ChannelRecord]
-            Tunnel records.
-
-        S : array-like
-            Common start point shared by every channel/conformation. The radial
-            shell coordinate is calculated relative to THIS point (not each
-            channel's own mouth) -- that's what makes "shell i" comparable
-            across different channels in Eq. 2.
-
-        h : int
-            Number of radial shells.
-
-        angle_threshold_deg, agg_amax_deg : float
-            Retained for compatibility with the original CAVER API.
-
-        n_samples : int
-            Number of points sampled along each centerline spline.
-
-        Returns
-        -------
-        records
-            The same records with representative data populated.
-        """
-        S = np.asarray(S, dtype=np.float64)
-
-        for record in records:
-            channel = record.channel
-            centerline_spline = channel.centerline_spline
-            radius_spline = channel.radius_spline
-            n_centers = len(channel.centers)
-
-            if n_centers < 2:
-                record.rep_points = [np.asarray(channel.centers, dtype=np.float32) for _ in range(h)]
-                record.rep_radii = [np.asarray(channel.radii, dtype=np.float32) for _ in range(h)]
-                record.shell_weights = np.ones(h, dtype=np.float32)
-                continue
-
-            t = np.linspace(0.0, float(n_centers - 1), self.n_samples, dtype=np.float64)
-
-            points = np.asarray(centerline_spline(t), dtype=np.float64)
-            if points.ndim == 2 and points.shape == (3, self.n_samples):
-                points = points.T
-            points = np.asarray(points, dtype=np.float64)
-
-            radii = np.asarray(radius_spline(t), dtype=np.float64).reshape(-1)
-            radii = np.maximum(radii, 0.0)
-
-            record.centerline_points = points.astype(np.float32, copy=False)
-            record.centerline_radii = radii.astype(np.float32, copy=False)
-
-            dxyz = np.diff(points, axis=0)
-            ds = np.linalg.norm(dxyz, axis=1)
-
-            # Radial coordinate relative to the SHARED start point S -- shell i
-            # must mean the same physical distance for every channel, or the
-            # per-shell comparison in Eq. 2 is comparing unrelated things.
-            radial_distance = np.linalg.norm(points - S[None, :], axis=1)
-
-            rmin = radial_distance.min()
-            rmax = radial_distance.max()
-
-            if rmax <= rmin:
-                shell_edges = np.full(h + 1, rmin, dtype=np.float64)
-            else:
-                shell_edges = np.linspace(rmin, rmax, h + 1, dtype=np.float64)
-
-            rep_points = []
-            rep_radii = []
-
-            for shell_i in range(h):
-                lo = shell_edges[shell_i]
-                hi = shell_edges[shell_i + 1]
-
-                if shell_i == h - 1:
-                    in_shell = (radial_distance >= lo) & (radial_distance <= hi)
-                else:
-                    in_shell = (radial_distance >= lo) & (radial_distance < hi)
-
-                if not np.any(in_shell):
-                    rep_points.append(np.empty((0, 3), dtype=np.float32))
-                    rep_radii.append(np.empty((0,), dtype=np.float32))
-                    continue
-
-                change = np.flatnonzero(in_shell[1:] != in_shell[:-1]) + 1
-                starts = np.concatenate((np.array([0]), change))
-                stops = np.concatenate((change, np.array([len(in_shell)])))
-
-                shell_rep_points = []
-                shell_rep_radii = []
-
-                for start, stop in zip(starts, stops):
-                    if not in_shell[start] or stop <= start:
-                        continue
-
-                    p = points[start:stop]
-                    r = radii[start:stop]
-
-                    if len(p) == 1:
-                        shell_rep_points.append(p[0])
-                        shell_rep_radii.append(r[0])
-                        continue
-
-                    segment_ds = ds[start:stop - 1]
-                    weights = np.empty(len(p), dtype=np.float64)
-                    weights[0] = segment_ds[0] * 0.5
-                    weights[-1] = segment_ds[-1] * 0.5
-                    if len(p) > 2:
-                        weights[1:-1] = (segment_ds[:-1] + segment_ds[1:]) * 0.5
-
-                    total_weight = weights.sum()
-                    if total_weight <= 0.0:
-                        centroid = p.mean(axis=0)
-                        mean_radius = r.mean()
-                    else:
-                        centroid = np.sum(p * weights[:, None], axis=0) / total_weight
-                        mean_radius = np.sum(r * weights) / total_weight
-
-                    shell_rep_points.append(centroid)
-                    shell_rep_radii.append(mean_radius)
-
-                if shell_rep_points:
-                    rep_points.append(np.asarray(shell_rep_points, dtype=np.float32))
-                    rep_radii.append(np.asarray(shell_rep_radii, dtype=np.float32))
-                else:
-                    rep_points.append(np.empty((0, 3), dtype=np.float32))
-                    rep_radii.append(np.empty((0,), dtype=np.float32))
-
-            record.rep_points = rep_points
-            record.rep_radii = rep_radii
-            record.shell_weights = np.ones(h, dtype=np.float32)
-
-        return records
-
-    def computeDistanceWeights(self, h, q= 1.0):
-        """w(x) = k1*x + k2, chosen so w(0.5) = 1 and w(1)/w(0) = q."""
-        if h == 1:
-            return np.array([1.0])
-        denom = (q - 1) * 0.5 + 1.0
-        k2 = 1.0 / denom if abs(denom) > 1e-12 else 1.0
-        k1 = k2 * (q - 1)
-        x = np.arange(h) / (h - 1)
-        return k1 * x + k2
-
-
-    # module-level worker state for optional multiprocessing 
-    _worker_shell_data = None
-    _worker_weights = None
-    _worker_n = None
-    _worker_normalize_radii = True
-    _worker_clip_distance = True
-    _worker_centroids=None
-    _worker_radii_means = None
-
-    def _initDistanceWorker(self, shell_data, weights, n, centroids, radii_means,
-                            normalize_radii=True,clip_distance=True):
-        """Populate worker-local state used by _distanceBlock(). Only the
-        small per-shell flattened representative arrays are sent to each
-        worker (via ProcessPoolExecutor's initializer/initargs), not the full
-        Channel objects."""
-
-        global _worker_shell_data,_worker_weights, _worker_n
-        global _worker_normalize_radii, _worker_clip_distance
-        global _worker_centroids, _worker_radii_means
-       
-        _worker_shell_data = shell_data
-        _worker_weights = np.asarray(weights, dtype=np.float32)
-        _worker_n = n
-        _worker_normalize_radii = normalize_radii
-        _worker_clip_distance = clip_distance
-        _worker_centroids = np.asarray(centroids, dtype=np.float32)
-        _worker_radii_means = np.asarray(radii_means,dtype=np.float32)
-
-    def _prepareAllShells(self, records, h):
-        """
-        Flatten every shell's representatives across all channels, ONCE, and
-        also precompute the TARGET-side grouping (group_starts/group_ids)
-        ONCE per shell -- these don't depend on which row-block is being
-        processed, so recomputing them per block (as a naive port would) is
-        pure waste. Only the SOURCE side is grouped per block, inside
-        _distance_block, since that genuinely differs per block.
-
-        Returns a list of length h, each element:
-            (points, radii, channel_ids, group_starts, group_ids)
-
-        channel_ids is sorted (built via np.repeat over np.arange(n)), and a
-        channel with an empty shell simply doesn't appear in it.
-        """
-        n = len(records)
-        per_shell = []
-
-        for s in range(h):
-            pts_list = [r.rep_points[s] for r in records]
-            lens = np.fromiter((len(p) for p in pts_list), dtype=np.int64, count=n)
-
-            if lens.sum() == 0:
-                per_shell.append((np.empty((0, 3), dtype=np.float32),
-                                    np.empty((0,), dtype=np.float32),
-                                    np.empty((0,), dtype=np.int32),
-                                    np.empty((0,), dtype=np.int64),
-                                    np.empty((0,), dtype=np.int32)))
-                continue
-
-            points = np.concatenate(pts_list, axis=0)
-            radii = np.concatenate([r.rep_radii[s] for r in records], axis=0)
-            channel_ids = np.repeat(np.arange(n, dtype=np.int32), lens)
-
-            group_starts = np.r_[0, np.flatnonzero(np.diff(channel_ids)) + 1]
-            group_ids = channel_ids[group_starts]
-
-            per_shell.append((points, radii, channel_ids, group_starts, group_ids))
-
-        return per_shell
-
-    def _prepareChannelCentroids(self, records):
-        """One 3D centroid + mean radius per channel, from ALL its representative
-        points/radii across every shell (falls back to the raw centerline data
-        for channels with zero populated shells)."""
-        n = len(records)
-        centroids = np.empty((n, 3), dtype=np.float32)
-        radii_means = np.empty(n, dtype=np.float32)          # <-- (n,), not (n,3)
-        for i, r in enumerate(records):
-            pts = [p for p in r.rep_points if len(p) > 0]
-            rds = [rad for rad in r.rep_radii if len(rad) > 0]
-            if pts:
-                centroids[i] = np.concatenate(pts, axis=0).mean(axis=0)
-                radii_means[i] = np.concatenate(rds, axis=0).mean()
-            else:
-                centroids[i] = np.asarray(r.channel.centers, dtype=np.float32).mean(axis=0)
-                radii_means[i] = np.asarray(r.channel.radii, dtype=np.float32).mean()
-        return centroids, radii_means
-
-    def _distanceBlock(self, block):
-        """
-        Calculate one row-block of the channel-distance matrix.
-
-        SOURCE-side grouping (this block's channels) is computed here since it
-        depends on `block`. TARGET-side grouping (group_starts/group_ids) is
-        read from the shared, precomputed shell data -- computed once in
-        _prepare_all_shells, not once per (shell, block) pair.
-        """
-        from scipy.spatial.distance import cdist
-        start, end = block
-
-        shell_data = _worker_shell_data
-        weights = _worker_weights
-        n = _worker_n
-        normalize_radii = _worker_normalize_radii
-        clip_distance = _worker_clip_distance
-        centroids = _worker_centroids
-        radii_means = _worker_radii_means   
-        h = len(weights)
-        block_n = end - start
-
-        Db = np.zeros((block_n, n), dtype=np.float32)
-        Wb = np.zeros((block_n, n), dtype=np.float32)
-
-        for shell in range(h):
-            w = weights[shell]
-            if w == 0:
-                continue
-
-            points, radii, channel_ids, group_starts, group_ids = shell_data[shell]
-            if len(points) == 0:
-                continue
-
-            # channel_ids is globally sorted, so searchsorted is cheaper than a
-            # boolean mask over the full array.
-            first = np.searchsorted(channel_ids, start, side="left")
-            last = np.searchsorted(channel_ids, end, side="left")
-            if first >= last:
-                continue
-
-            A = points[first:last]
-            rA = radii[first:last]
-            idA = channel_ids[first:last] - start          # local to this block, still sorted
-
-            B = points
-            rB = radii
-
-            spatial = cdist(A, B)
-            if normalize_radii:
-                spatial = spatial / np.maximum(rA[:, None] + rB[None, :], 1e-8)
-                if clip_distance:
-                    np.minimum(spatial, 1.0, out=spatial)
-
-            # Reduce SOURCE representatives -> one row per source channel.
-            source_change = np.flatnonzero(np.diff(idA)) + 1
-            source_starts = np.r_[0, source_change]
-            source_ids = idA[source_starts]
-            source_reduced = np.minimum.reduceat(spatial, source_starts, axis=0)
-
-            # Reduce TARGET representatives using the CACHED grouping.
-            target_reduced = np.minimum.reduceat(source_reduced, group_starts, axis=1)
-
-            Db[np.ix_(source_ids, group_ids)] += w * target_reduced
-            Wb[np.ix_(source_ids, group_ids)] += w
-
-        valid_pairs = Wb > 0
-        Db[valid_pairs] /= Wb[valid_pairs]
-        #no shell populated by both = maximally different
-        #radii normalization and centroid sampling may be inconsistent from rest of
-        #algorithm, but this is only a fallback case use to estimate the distance 
-        #between channels that do not occupy any of the same shells
-        #and therefore should have a large distance, approximation of channels
-        #that should never be clustered
-        invalid = ~valid_pairs
-        if np.any(invalid):
-            fallback = cdist(centroids[start:end], centroids)
-            if normalize_radii:
-                rA_c = radii_means[start:end]
-                rB_c = radii_means
-                fallback = fallback / np.maximum(rA_c[:, None] + rB_c[None, :], 1e-8)
-                if clip_distance:
-                    np.minimum(fallback, 1.0, out=fallback)   
-            Db[invalid] = fallback[invalid]
-
-        return start, end, Db
-
-
-    def computeThroughput(self, records):
-        """throughput = exp(-cost). Stored as `channel.throughput`"""
-        costs = np.array([r.channel.cost if r.channel.cost is not None else np.inf for r in records])
-        throughputs = np.exp(-costs)
-        for r, t in zip(records, throughputs):
-            r.channel.throughput = float(t)
-
-##### Functions Related to the Center Sampling Pipeline #####
-
-
-
-
-
-
-#: Colour of each rank - the 0-based position of an object among those a viewer
-#: script draws. One table for every PyMOL, VMD and ChimeraX script this module
-#: writes, so that a channel is the same colour in all of them; it is
-#: CaviTracerMD's viewer palette, unchanged.
-#:
-#: Ranks 0-5 are CAVER 3's first six colours, from its out/pymol/modules/rgb.py
-#: in the order its view.py hands them to tunnel clusters. They are what makes a
-#: CAVER figure recognisable, so they are kept verbatim.
-_CAVER_PRIMARIES = [(0.0, 0.0, 1.0),    # blue
-                    (0.0, 1.0, 0.0),    # green
-                    (1.0, 0.0, 0.0),    # red
-                    (0.0, 1.0, 1.0),    # cyan
-                    (1.0, 1.0, 0.0),    # yellow
-                    (1.0, 0.0, 1.0)]    # magenta
-
-# Ranks 6-199 are a table, not generated: the rule below searches many thousands
-# of candidates, which a viewer should not be doing before it draws.
-#
-# Taken farthest-first: each rank is the candidate farthest from every colour
-# before it and from the reserved greys, so the closest pair among the first n
-# colours falls as slowly as the candidates allow and the worst pairs come last.
-# Distance is OKLab x100 between versions of each colour dimmed in linear light
-# to ten levels from 0.55 to 1, the closest pair of versions counting: a sphere
-# runs from lit to shadowed, so two colours are distinct only if no shade of one
-# matches a shade of the other. Candidates are HSV at every degree of hue, with
-# saturation 0.45-1 and value 0.60-1 in five steps each, less those within 7 of
-# either reserved grey - 0.45, and the grey80 a protein is drawn in. The value
-# floor keeps out colours that turn near-black in shadow, which the distance
-# alone would rank highly for being far from everything light. Regenerate on
-# those terms or not at all.
-_PALETTE = _CAVER_PRIMARIES + [
-    (0.430, 0.000, 0.600),  # 6
-    (0.000, 0.533, 1.000),  # 7
-    (0.782, 0.550, 1.000),  # 8
-    (1.000, 0.580, 0.100),  # 9
-    (0.000, 0.600, 0.260),  # 10
-    (0.700, 0.000, 0.432),  # 11
-    (1.000, 0.550, 0.670),  # 12
-    (0.150, 0.255, 0.600),  # 13
-    (0.600, 0.300, 0.000),  # 14
-    (0.550, 1.000, 0.617),  # 15
-    (0.400, 0.100, 1.000),  # 16
-    (0.600, 0.560, 0.000),  # 17
-    (0.550, 0.715, 1.000),  # 18
-    (0.688, 0.250, 1.000),  # 19
-    (0.479, 0.330, 0.600),  # 20
-    (1.000, 0.400, 0.850),  # 21
-    (0.000, 0.642, 0.700),  # 22
-    (0.600, 0.000, 0.100),  # 23
-    (1.000, 0.880, 0.550),  # 24
-    (0.470, 0.400, 1.000),  # 25
-    (0.230, 0.000, 0.600),  # 26
-    (0.600, 0.330, 0.406),  # 27
-    (1.000, 0.250, 0.462),  # 28
-    (0.240, 0.414, 0.600),  # 29
-    (0.683, 1.000, 0.000),  # 30
-    (1.000, 0.400, 0.250),  # 31
-    (1.000, 0.670, 0.550),  # 32
-    (0.000, 0.333, 1.000),  # 33
-    (0.000, 0.000, 0.600),  # 34
-    (0.330, 0.600, 0.456),  # 35
-    (0.870, 0.400, 1.000),  # 36
-    (0.600, 0.150, 0.585),  # 37
-    (0.550, 0.887, 1.000),  # 38
-    (1.000, 0.100, 0.760),  # 39
-    (0.000, 0.700, 1.000),  # 40
-    (1.000, 0.767, 0.000),  # 41
-    (0.550, 0.565, 1.000),  # 42
-    (0.785, 0.900, 0.495),  # 43
-    (0.000, 0.900, 0.450),  # 44
-    (0.550, 1.000, 0.843),  # 45
-    (0.600, 0.456, 0.240),  # 46
-    (0.567, 0.000, 1.000),  # 47
-    (1.000, 0.550, 0.865),  # 48
-    (1.000, 0.400, 0.660),  # 49
-    (0.490, 0.700, 0.175),  # 50
-    (0.600, 0.240, 0.474),  # 51
-    (0.336, 0.240, 0.600),  # 52
-    (0.817, 0.000, 1.000),  # 53
-    (0.000, 1.000, 0.767),  # 54
-    (0.650, 0.400, 1.000),  # 55
-    (0.250, 0.100, 1.000),  # 56
-    (0.600, 0.150, 0.292),  # 57
-    (0.250, 0.425, 1.000),  # 58
-    (0.700, 0.448, 0.385),  # 59
-    (0.700, 0.245, 0.175),  # 60
-    (1.000, 0.400, 0.460),  # 61
-    (1.000, 0.720, 0.400),  # 62
-    (0.581, 0.280, 0.700),  # 63
-    (0.400, 0.200, 0.800),  # 64
-    (1.000, 0.250, 0.662),  # 65
-    (0.505, 0.600, 0.330),  # 66
-    (0.330, 0.339, 0.600),  # 67
-    (0.955, 0.550, 1.000),  # 68
-    (0.000, 0.170, 0.600),  # 69
-    (0.760, 1.000, 0.400),  # 70
-    (0.400, 0.620, 1.000),  # 71
-    (0.320, 0.632, 0.800),  # 72
-    (1.000, 0.940, 0.400),  # 73
-    (1.000, 0.250, 0.912),  # 74
-    (0.400, 0.500, 1.000),  # 75
-    (1.000, 0.000, 0.517),  # 76
-    (1.000, 0.000, 0.300),  # 77
-    (0.000, 0.700, 0.478),  # 78
-    (0.385, 0.700, 0.674),  # 79
-    (0.000, 0.340, 0.600),  # 80
-    (0.250, 0.200, 0.800),  # 81
-    (1.000, 0.520, 0.400),  # 82
-    (0.887, 0.250, 1.000),  # 83
-    (0.550, 1.000, 0.985),  # 84
-    (0.000, 0.700, 0.618),  # 85
-    (0.390, 0.700, 0.385),  # 86
-    (0.394, 0.900, 0.225),  # 87
-    (1.000, 0.467, 0.000),  # 88
-    (0.700, 0.385, 0.679),  # 89
-    (0.330, 0.000, 0.600),  # 90
-    (0.250, 0.887, 1.000),  # 91
-    (0.683, 0.000, 1.000),  # 92
-    (1.000, 0.250, 0.275),  # 93
-    (0.700, 0.000, 0.548),  # 94
-    (0.446, 0.175, 0.700),  # 95
-    (0.000, 0.700, 0.000),  # 96
-    (0.700, 0.280, 0.329),  # 97
-    (0.700, 0.350, 0.280),  # 98
-    (0.569, 0.175, 0.700),  # 99
-    (1.000, 0.400, 0.980),  # 100
-    (0.580, 1.000, 0.400),  # 101
-    (0.000, 0.195, 0.900),  # 102
-    (1.000, 0.267, 0.000),  # 103
-    (0.163, 0.000, 0.700),  # 104
-    (0.850, 1.000, 0.000),  # 105
-    (0.700, 0.537, 0.000),  # 106
-    (1.000, 0.550, 0.550),  # 107
-    (0.250, 1.000, 0.875),  # 108
-    (0.250, 1.000, 0.637),  # 109
-    (0.550, 0.000, 0.600),  # 110
-    (0.700, 0.280, 0.665),  # 111
-    (0.700, 0.647, 0.385),  # 112
-    (0.000, 0.617, 1.000),  # 113
-    (0.000, 0.460, 0.600),  # 114
-    (0.700, 0.280, 0.441),  # 115
-    (1.000, 0.667, 0.000),  # 116
-    (0.294, 0.600, 0.060),  # 117
-    (0.000, 0.800, 1.000),  # 118
-    (0.700, 0.443, 0.000),  # 119
-    (1.000, 0.000, 0.633),  # 120
-    (1.000, 0.883, 0.000),  # 121
-    (0.700, 0.175, 0.525),  # 122
-    (0.662, 0.550, 1.000),  # 123
-    (0.550, 0.640, 1.000),  # 124
-    (1.000, 0.610, 0.400),  # 125
-    (0.700, 0.385, 0.574),  # 126
-    (0.483, 0.000, 1.000),  # 127
-    (0.280, 0.350, 0.700),  # 128
-    (0.700, 0.000, 0.257),  # 129
-    (1.000, 0.000, 0.883),  # 130
-    (1.000, 0.752, 0.550),  # 131
-    (0.700, 0.175, 0.236),  # 132
-    (0.630, 0.700, 0.000),  # 133
-    (1.000, 0.000, 0.417),  # 134
-    (0.940, 1.000, 0.400),  # 135
-    (1.000, 0.250, 0.562),  # 136
-    (0.250, 0.337, 1.000),  # 137
-    (0.294, 0.280, 0.700),  # 138
-    (0.700, 1.000, 0.550),  # 139
-    (0.495, 0.900, 0.657),  # 140
-    (1.000, 0.550, 0.767),  # 141
-    (0.400, 0.690, 1.000),  # 142
-    (1.000, 0.800, 0.400),  # 143
-    (0.700, 0.140, 0.000),  # 144
-    (0.788, 0.250, 1.000),  # 145
-    (0.000, 1.000, 0.350),  # 146
-    (0.700, 0.455, 0.280),  # 147
-    (1.000, 0.400, 0.560),  # 148
-    (0.280, 0.413, 0.700),  # 149
-    (0.700, 0.175, 0.438),  # 150
-    (0.413, 0.250, 1.000),  # 151
-    (0.483, 0.280, 0.700),  # 152
-    (0.600, 0.250, 1.000),  # 153
-    (0.750, 0.400, 1.000),  # 154
-    (1.000, 0.400, 0.750),  # 155
-    (0.000, 0.467, 1.000),  # 156
-    (0.600, 0.230, 0.000),  # 157
-    (1.000, 0.970, 0.550),  # 158
-    (0.700, 0.665, 0.280),  # 159
-    (1.000, 0.250, 0.750),  # 160
-    (0.988, 0.250, 1.000),  # 161
-    (0.070, 0.469, 0.700),  # 162
-    (0.700, 0.000, 0.350),  # 163
-    (0.900, 0.484, 0.225),  # 164
-    (0.385, 0.458, 0.700),  # 165
-    (0.400, 1.000, 0.530),  # 166
-    (0.175, 0.236, 0.700),  # 167
-    (1.000, 0.440, 0.400),  # 168
-    (0.550, 0.782, 1.000),  # 169
-    (0.700, 0.000, 0.665),  # 170
-    (0.350, 0.700, 0.280),  # 171
-    (0.000, 0.360, 0.900),  # 172
-    (0.333, 0.000, 1.000),  # 173
-    (0.560, 0.400, 1.000),  # 174
-    (0.400, 1.000, 0.940),  # 175
-    (0.560, 0.700, 0.280),  # 176
-    (0.895, 0.100, 1.000),  # 177
-    (0.700, 0.385, 0.385),  # 178
-    (0.248, 0.150, 0.600),  # 179
-    (0.225, 0.439, 0.900),  # 180
-    (0.280, 0.616, 0.700),  # 181
-    (0.400, 0.560, 1.000),  # 182
-    (0.400, 1.000, 0.790),  # 183
-    (0.250, 0.575, 1.000),  # 184
-    (0.469, 0.385, 0.700),  # 185
-    (0.400, 1.000, 0.700),  # 186
-    (1.000, 0.325, 0.250),  # 187
-    (0.400, 0.440, 1.000),  # 188
-    (0.000, 0.230, 0.600),  # 189
-    (1.000, 0.367, 0.000),  # 190
-    (0.145, 0.100, 1.000),  # 191
-    (1.000, 0.250, 0.375),  # 192
-    (0.400, 0.960, 1.000),  # 193
-    (1.000, 0.738, 0.250),  # 194
-    (1.000, 0.610, 0.550),  # 195
-    (1.000, 0.650, 0.250),  # 196
-    (0.060, 0.096, 0.600),  # 197
-    (1.000, 0.250, 0.825),  # 198
-    (0.800, 0.370, 0.200),  # 199
-]
-
-
-def _paletteIndex(rank):
-    """Row of :data:`_PALETTE` holding the colour of the 0-based *rank*.
-
-    Past rank 199 the ranks cycle through 6-199 and the primaries never repeat.
-    That far out no palette keeps every pair apart, so colour stops identifying
-    an object there and its name has to."""
-
-    first = len(_CAVER_PRIMARIES)
-    if rank < len(_PALETTE):
-        return rank
-    return first + (rank - first) % (len(_PALETTE) - first)
-
-
-def _hexColour(rank):
-    """*rank*'s colour as ``#rrggbb``, the form a ChimeraX script gives it in."""
-
-    return '#%02x%02x%02x' % tuple(int(round(255 * value))
-                                   for value in _PALETTE[_paletteIndex(rank)])
-
-
-#: The VMD colour IDs ranks 0-29 take, in order: every fixed ID from 0 to 32 but
-#: 2 (gray), 8 (white) and 16 (black), which the protein, the background and the
-#: labels keep. Their RGB is redefined to the palette's, and the first six were
-#: already VMD's nearest to the CAVER primaries. Later ranks take the IDs from 33
-#: on, VMD's colour-scale slots: the whole palette fits there, but VMD regenerates
-#: them whenever its colour scale is changed, which it never does to a fixed ID.
-_VMD_COLOR_IDS = (0, 7, 1, 10, 4, 11, 3, 9, 12, 13, 14, 15, 5, 6, 17, 18, 19,
-                  20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32)
-
-
-def _vmdColorID(rank):
-    """The VMD colour ID carrying *rank*'s colour (see :data:`_VMD_COLOR_IDS`)."""
-
-    index = _paletteIndex(rank)
-    if index < len(_VMD_COLOR_IDS):
-        return _VMD_COLOR_IDS[index]
-    return 33 + index - len(_VMD_COLOR_IDS)
-
-
-def _vmdPalette(count):
-    """Tcl giving ranks ``0 .. count-1`` their palette colours, and listing the
-    IDs that carry them, rank by rank, as ``cavitracer_colors``."""
-
-    lines = ['# The CaviTracer palette, the same as in the PyMOL and ChimeraX',
-             '# scripts. Ranks 0-29 redefine fixed colour IDs; later ranks use the',
-             '# colour-scale IDs from 33 on, which VMD regenerates if the colour',
-             '# scale is changed.']
-    ids, defined = [], set()
-    for rank in range(count):
-        color_id = _vmdColorID(rank)
-        if color_id not in defined:
-            defined.add(color_id)
-            lines.append('color change rgb %d %.3f %.3f %.3f'
-                         % ((color_id,) + tuple(_PALETTE[_paletteIndex(rank)])))
-        ids.append(str(color_id))
-    lines.append('set cavitracer_colors {%s}' % ' '.join(ids))
-    return '\n'.join(lines)
-
-
-#: The palette as a PyMOL script carries it: the table, and ``caverColour`` to
-#: register a rank's colour on first use.
-_VIS_PALETTE = r'''# --- Palette ---
-# The CaviTracer palette, the same as in the VMD and ChimeraX scripts, so that a
-# channel is the same colour in all three. Ranks 0-5 are CAVER 3's first six
-# colours; ranks 6-199 were taken farthest-first for how they read on shaded
-# spheres. Past rank 199 the ranks cycle through 6-199 and the primaries never
-# repeat.
-PALETTE = [
-__ROWS__]
-CAVER_PRIMARIES = PALETTE[:6]
-
-def caverColour(rank):
-    """Name of the colour for a 0-based rank, registered on first use.
-
-    A lookup and nothing else: a rank is the same colour in every structure,
-    every run and every viewer, whatever was loaded beside it."""
-    first = len(CAVER_PRIMARIES)
-    if rank >= len(PALETTE):
-        rank = first + (rank - first) % (len(PALETTE) - first)
-    name = "caver%d" % (rank + 1) if rank < first else "gen%d" % rank
-    cmd.set_color(name, list(PALETTE[rank]))
-    return name
-# --- End of palette ---
-'''.replace('__ROWS__', ''.join('    (%.3f, %.3f, %.3f),  # %d\n' % (rgb + (rank,))
-                                for rank, rgb in enumerate(_PALETTE)))
-
-
-#: Source of the PyMOL viewer that :func:`_writeVisScript` leaves beside what
-#: :func:`writePyMolCaviTracerScript` writes. Held inline so that this module
-#: carries everything it writes, and raw so the rank patterns keep their
-#: backslashes.
-_VIS_CHANNELS_SCRIPT = r'''import glob
+#: Source of the PyMOL viewer that :func:`_writeVisScript` leaves beside the
+#: PQR output. Held inline so that this module carries everything it writes,
+#: and raw so the rank patterns keep their backslashes.
+_VIS_CHANNELS_SCRIPT = r'''import colorsys
+import glob
 import os
 import re
 import shlex
@@ -13397,8 +10921,6 @@ import sys
 # --- Parse command-line args ---
 # Invoke as:  pymol vis_channels.py -- protein.pdb "por*chl*.pqr"
 #         or: pymol vis_channels.py -- protein.pdb channels.cif
-#         or: pymol vis_channels.py -- protein.pdb channels.pqr  (every channel)
-#         or: pymol vis_channels.py -- protein.pdb frames.pqr    (a state per frame)
 #         or: pymol vis_channels.py -- channels.cif        (structure inside)
 # The regex MUST be quoted so the shell doesn't glob-expand it before PyMOL sees it.
 #
@@ -13406,16 +10928,8 @@ import sys
 # spheres and are coloured off the same 0-based rank, so a channel is the same
 # colour whichever way the run was written, and a directory holding both opens
 # with either in view.
-def holdsChannels(path):
-    """Whether *path* is a PQR of channels rather than a structure: every
-    sphere this module writes is a FIL residue, which no structure holds."""
-    with open(path) as handle:
-        return any(line.startswith(("ATOM", "HETATM")) and line[17:20] == "FIL"
-                   for line in handle)
-
 protein_file = None
 cif_file = None
-pqr_files = []
 channel_regex = None
 for arg in sys.argv[1:]:
     # Without a "--" PyMOL leaves its own flags and this script in argv, and the
@@ -13428,10 +10942,6 @@ for arg in sys.argv[1:]:
         if arg.lower().endswith(".cif"):
             if cif_file is None:
                 cif_file = arg
-        # A PQR named outright is a file of channels, split below, unless it
-        # holds none: a structure can be a PQR as well.
-        elif arg.lower().endswith(".pqr") and holdsChannels(arg):
-            pqr_files.append(arg)
         elif protein_file is None:
             protein_file = arg
     elif channel_regex is None:
@@ -13442,7 +10952,7 @@ if channel_regex is None:
 
 # Nothing named and no PQRs about: an mmCIF run leaves a single file, so look
 # for one before giving up.
-if cif_file is None and not pqr_files and not glob.glob(channel_regex):
+if cif_file is None and not glob.glob(channel_regex):
     found = sorted(glob.glob("*.cif"))
     if found:
         cif_file = found[0]
@@ -13450,10 +10960,60 @@ if cif_file is None and not pqr_files and not glob.glob(channel_regex):
 print(f"Using channel regex: {channel_regex}")
 if cif_file:
     print(f"Using mmCIF: {cif_file}")
-for path in pqr_files:
-    print(f"Using PQR: {path}")
 
-''' + _VIS_PALETTE + r'''
+# --- Palette ---
+# CAVER 3's first six colours, from its out/pymol/modules/rgb.py in the order
+# its view.py hands them to tunnel clusters. They are what makes a CAVER figure
+# recognisable, so they are kept verbatim. Its remaining 1000 are a long table
+# of pastels that the generator below beats on separation, so they are not.
+CAVER_PRIMARIES = [(0.0, 0.0, 1.0),    # blue
+                   (0.0, 1.0, 0.0),    # green
+                   (1.0, 0.0, 0.0),    # red
+                   (0.0, 1.0, 1.0),    # cyan
+                   (1.0, 1.0, 0.0),    # yellow
+                   (1.0, 0.0, 1.0)]    # magenta
+
+# Past the six, colours are generated rather than tabulated. The hue steps by
+# the golden angle -- an irrational fraction of the circle, so it never returns
+# to a hue it has used and consecutive steps land as far apart as the circle
+# allows -- while saturation and value cycle on 3, so neighbours differ in more
+# than hue alone.
+#
+# The offset and the cycle are chosen for how the colours read on shaded
+# spheres, not as flat swatches. A sphere runs from lit to shadowed, so the
+# shadowed side of a bright colour can match the lit side of a dark one: two
+# colours count as distinct only if no version of one, dimmed to as little as
+# 0.55 of its light, matches such a version of the other. Distance is OKLab,
+# taken against the six primaries as well as among the generated colours, and
+# the worst pair is maximised across 8 to 24 channels, where most runs sit.
+#
+# Re-tune on those terms or not at all. Flat CIE-Lab rated the previous choice
+# near 15 where OKLab found 4.1, with rank 6 the same cyan as rank 3, and a
+# cycle tuned on flat OKLab alone collapsed its greens into one another once
+# shaded. Past a dozen channels no palette keeps every pair apart, so colour
+# stops identifying a channel there and the object names have to.
+GOLDEN_ANGLE = (3.0 - 5.0 ** 0.5) / 2.0
+HUE_OFFSET = 0.796
+SATURATION_VALUE = ((0.95, 0.55), (0.65, 0.65), (0.65, 0.95))
+
+def caverColour(rank):
+    """Name of the colour for a 0-based channel rank, registered on first use.
+
+    A pure function of the rank, with no table to run off the end of: a rank is
+    the same colour in every structure and every run, whatever was loaded
+    beside it and however many channels the case turned out to have.
+    """
+    if rank < len(CAVER_PRIMARIES):
+        name, rgb = "caver%d" % (rank + 1), CAVER_PRIMARIES[rank]
+    else:
+        step = rank - len(CAVER_PRIMARIES)
+        saturation, value = SATURATION_VALUE[step % len(SATURATION_VALUE)]
+        name = "gen%d" % rank
+        rgb = colorsys.hsv_to_rgb(
+            (HUE_OFFSET + (step + 1) * GOLDEN_ANGLE) % 1.0, saturation, value)
+    cmd.set_color(name, list(rgb))
+    return name
+
 def cifLoops(path):
     """category -> (columns, rows-as-token-lists). Enough CIF for what we write.
 
@@ -13650,144 +11210,16 @@ def loadCifChannels(path):
 
     return groups
 
-# The label each object's REMARK carries in a PQR, in the schema's words where
-# it has them, so that a PQR's objects are grouped exactly as an mmCIF's are.
-PQR_KINDS = {"channel": "Tunnel", "pore": "Pore", "link": "Path",
-             "cavity": "Cavity"}
-
-def loadPqrChannels(path):
-    """Draw every object in a PQR holding several, one PyMOL object each.
-
-    The file keeps them apart by residue number alone, so PyMOL loads it whole
-    as a single object whose channels cannot be hidden or coloured apart. Split
-    here the way loadCifChannels splits an mmCIF, with the same names, colours
-    and groups, so a run opens the same way whichever format it was written in.
-
-    A multi-model PQR, a MODEL per frame as mergeFramesPQR writes it, gives
-    every object a state per frame, titled with the frame's number: the object
-    of rank n holds the n-th channel of each frame, and stepping through the
-    states steps through the frames. In a frame with fewer channels than that
-    the object has nothing to show.
-
-    Surface cavities are drawn as the surface around their markers, as the VMD
-    and ChimeraX scripts draw them. A file of connected cavities and channels
-    holds the cavities on chain C and the channels on chain H, each numbered
-    from 1, so the chain is part of what tells one object from another.
-    """
-    # (MODEL number, {(chain, index): spheres}) per frame; a file without MODEL
-    # records is a single frame, numbered None. placeholders: state -> the NIL
-    # atom mergeFramesPQR puts in a frame that found nothing.
-    models, kinds, label, placeholders = [], {}, "channel", {}
-    with open(path) as handle:
-        for line in handle:
-            if line.startswith("MODEL"):
-                models.append((line[5:].strip(), {}))
-            elif line.startswith("REMARK"):
-                words = line.split()
-                if len(words) > 2 and words[1] in PQR_KINDS:
-                    label = words[1]
-            elif line.startswith(("ATOM", "HETATM")) and line[17:20] == "NIL":
-                if not models:
-                    models.append((None, {}))
-                placeholders[len(models)] = line
-            elif line.startswith(("ATOM", "HETATM")) and line[17:20] == "FIL":
-                if not models:
-                    models.append((None, {}))
-                # Fixed columns for the coordinates: three %8.3f values run
-                # together without a space once one of them reaches -100.
-                key = (line[21], int(line[22:26]) - 1)
-                kinds.setdefault(key, "cavity" if key[0] == "C" else label)
-                models[-1][1].setdefault(key, []).append(
-                    (float(line[30:38]), float(line[38:46]),
-                     float(line[46:54]), float(line.split()[-1])))
-
-    # Colours by rank, as in the VMD and ChimeraX scripts: a file holding both
-    # cavities and channels colours the cavities in turn and the channels after
-    # them, so that the two are not given the same colours.
-    cavities = sorted(key for key in kinds if kinds[key] == "cavity")
-    others = sorted(key for key in kinds if kinds[key] != "cavity")
-    if cavities and others:
-        colours = dict((key, caverColour(position))
-                       for position, key in enumerate(cavities + others))
-    else:
-        colours = dict((key, caverColour(key[1])) for key in kinds)
-
-    groups = {}
-    for key in cavities + others:
-        index = key[1]
-        colour = colours[key]
-        obj = freeName(f"{kinds[key]}{index}")
-        count = frames = 0
-
-        for state, (number, samples) in enumerate(models, start=1):
-            spheres = samples.get(key)
-            if not spheres:
-                continue
-            text = "".join(
-                "ATOM  %5d  H   FIL T%4d    %8.3f%8.3f%8.3f%6.2f%6.2f\n"
-                % (i + 1, i + 1, x, y, z, 1.00, radius)
-                for i, (x, y, z, radius) in enumerate(spheres))
-            # Discrete, so that each state keeps atoms of its own: the channel
-            # of one frame is as long as it is, not as the first frame's.
-            cmd.read_pdbstr(text, obj, state=state, discrete=1)
-            if number is not None:
-                cmd.set_title(obj, state, f"frame {number}")
-            count += len(spheres)
-            frames += 1
-
-        # Read as PDB text, which keeps the radius column as the B-factor in
-        # every state (unlike PyMOL's PQR reader, see loadSpheres).
-        cmd.alter(obj, "vdw = b")
-        cmd.hide("everything", obj)
-        if kinds[key] == "cavity":
-            # A cavity is a cloud of markers of one size, not a route of probe
-            # spheres, so it is drawn as the surface around them. Every marker
-            # is a hydrogen, which a surface leaves out unless told otherwise.
-            cmd.set("surface_mode", 1, obj)
-            cmd.show("surface", obj)
-        else:
-            cmd.show("spheres", obj)
-        cmd.color(colour, obj)
-
-        kind = PQR_KINDS[kinds[key]]
-        groups.setdefault(kind, []).append(obj)
-        note = f" in {frames} of {len(models)} frames" if len(models) > 1 else ""
-        print(f"  {obj:<20s} {colour}  ({kind}, {count} spheres{note})")
-
-    # A frame that found nothing holds only its placeholder, which goes into an
-    # object of its own, drawn as nothing. The frame then keeps its state even
-    # where no object has anything in it - an empty last frame would otherwise
-    # leave PyMOL counting one frame fewer than the file holds.
-    if placeholders:
-        empty = freeName("empty_frames")
-        for state, line in sorted(placeholders.items()):
-            cmd.read_pdbstr(line, empty, state=state, discrete=1)
-            number = models[state - 1][0]
-            if number is not None:
-                cmd.set_title(empty, state, f"frame {number}, nothing found")
-        cmd.hide("everything", empty)
-        print(f"  {empty:<20s} {len(placeholders)} frame(s) that found nothing")
-
-    if len(models) > 1:
-        print(f"  {len(models)} frames, a state each: step through them with the "
-              f"arrow keys or the movie controls.")
-
-    return groups
-
 # both sets read their rank off the same 0-based scale, so the first channel of
 # either program is blue and the two stay comparable side by side
 sets = [("chnl_grp", sorted(glob.glob(channel_regex), key=natural_sort_key), False),
         ("tun_grp", sorted(glob.glob("tun_*"), key=natural_sort_key), True)]
 
-CIF_GROUPS = {"Tunnel": "chnl_grp", "Pore": "pore_grp", "Path": "link_grp",
-              "Cavity": "cav_grp"}
+CIF_GROUPS = {"Tunnel": "chnl_grp", "Pore": "pore_grp", "Path": "link_grp"}
 
-if cif_file or pqr_files:
-    groups = loadCifChannels(cif_file) if cif_file else {}
-    for path in pqr_files:
-        for kind, objects in loadPqrChannels(path).items():
-            groups.setdefault(kind, []).extend(objects)
-    for kind, objects in sorted(groups.items()):
+if cif_file:
+    cif_groups = loadCifChannels(cif_file)
+    for kind, objects in sorted(cif_groups.items()):
         group = CIF_GROUPS.get(kind, kind.lower() + "_grp")
         cmd.group(freeName(group), " ".join(objects))
     cmd.rebuild()
@@ -13795,8 +11227,8 @@ if cif_file or pqr_files:
     cmd.set("sphere_quality", 2)
     cmd.bg_color("white")
     cmd.zoom()
-    print(f"Success: {sum(len(o) for o in groups.values())} object(s) "
-          f"loaded from {', '.join(([cif_file] if cif_file else []) + pqr_files)}.")
+    print(f"Success: {sum(len(o) for o in cif_groups.values())} object(s) "
+          f"loaded from {cif_file}.")
 elif not any(files for _, files, _ in sets):
     print("Error: No channel files found. Check your working directory (pwd).")
 else:
@@ -13831,24 +11263,33 @@ else:
     cmd.zoom()
     print("Success: Files loaded in perfect sequential order with custom radii!")
 '''
-
-
-_VIS_CHANNELS_TRAJ_SCRIPT = r"""
+#: Source of the multi-state PyMOL viewer for trajectory/ensemble runs,
+#: left beside a directory of per-frame subdirectories the same way
+#: _VIS_CHANNELS_SCRIPT is left beside a single frame's output.
+_VIS_CHANNELS_TRAJ_SCRIPT = r'''
 import glob
 import os
 import re
 import sys
 import colorsys
+import shlex
  
-# --- args ---
-args = [a for a in sys.argv[1:] if a != "--"]
-file_pattern = next((a for a in args if not os.path.isfile(a)), "*.pqr")
-protein_file = next((a for a in args if os.path.isfile(a)), None)
- 
-files = sorted(glob.glob(file_pattern))
-if not files:
-    print("No files matched %r" % file_pattern)
+# --- args: frame-directory glob, channel pattern, optional protein/cif ---
+if len(sys.argv) < 2:
+    print('Usage: pymol vis_channels_traj.py -- "frames/frame*" "chl*.pqr" [protein.pdb]')
     raise SystemExit
+ 
+args = [a for a in sys.argv[1:] if a != "--"]
+frame_glob = args[0]
+channel_pattern = args[1] if len(args) > 1 else "chl*.pqr"
+protein_file = next((a for a in args[2:] if os.path.isfile(a)), None)
+ 
+frame_dirs = sorted(glob.glob(frame_glob))
+if not frame_dirs:
+    print("No frame directories matched %r" % frame_glob)
+    raise SystemExit
+n_states = len(frame_dirs)
+print("Found %d frame(s) under %r" % (n_states, frame_glob))
  
 if protein_file:
     protein_name = os.path.splitext(os.path.basename(protein_file))[0]
@@ -13876,110 +11317,78 @@ def caverColour(rank):
     cmd.set_color(name, list(rgb))
     return name
  
-# --- split "channels100_sp0_chl10.pqr" into (frame=100, rest="_sp0_chl10.pqr") ---
-FRAME_PREFIX = re.compile(r'^[A-Za-z]+(\d+)')
+RANK_PATTERNS = ((r'chl(\d+)', 0), (r'cl_(\d+)', 1), (r'(\d+)', 0))
  
-def splitFrame(filename):
+def channelRank(filename):
     base = os.path.basename(filename)
-    match = FRAME_PREFIX.match(base)
-    if not match:
-        return None, base
-    frame = int(match.group(1))
-    return frame, base[match.end():]
+    for pattern, first in RANK_PATTERNS:
+        match = re.search(pattern, base)
+        if match:
+            return max(0, int(match.group(1)) - first)
+    return None
  
-# Rank patterns run against `rest` ONLY (frame number already stripped), so
-# there is no frame-number/rank collision the way there would be running
-# these against the whole filename.
-CHANNEL_RANK = re.compile(r'chl(\d+)')
-LINK_RANK = re.compile(r'lnk(\d+)')
+def cifLoops(path):
+    # same minimal reader as vis_channels.py -- it reads back only what this
+    # module writes, not arbitrary CIF; see that script for why.
+    loops = {}
+    with open(path) as handle:
+        lines = handle.read().splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() != "loop_":
+            i += 1
+            continue
+        i += 1
+        columns, category = [], None
+        while i < len(lines) and lines[i].startswith("_"):
+            category, _, column = lines[i].strip()[1:].partition(".")
+            columns.append(column)
+            i += 1
+        rows = []
+        while i < len(lines) and lines[i] and not lines[i][0] in "#_" \
+                and not lines[i].startswith(("loop_", "data_")):
+            try:
+                tokens = shlex.split(lines[i])
+            except ValueError:
+                tokens = lines[i].split()
+            if len(tokens) == len(columns):
+                rows.append(tokens)
+            i += 1
+        loops[category] = (columns, rows)
+    return loops
  
-def channelRank(rest):
-    match = CHANNEL_RANK.search(rest)
-    return int(match.group(1)) if match else None
+# --- gather, per rank, the file/data for each frame (missing -> empty state) ---
+# rank -> {state_index (1-based): (is_cif, payload)}
+#   payload for a PQR frame is the filename
+#   payload for a CIF frame is (channel_id, [(x,y,z,radius), ...])
+by_rank = {}
+is_cif_mode = channel_pattern.lower().endswith(".cif")
  
-def linkRank(rest):
-    match = LINK_RANK.search(rest)
-    return int(match.group(1)) if match else None
- 
-# Cluster id, added by a post-hoc rename pass (e.g. "..._chl3_clid7.pqr" or
-# "..._chl3_clidnoise.pqr" for HDBSCAN's -1/noise label). Kept as a string so
-# "noise" and numeric ids share one lookup; numeric ids are cast to int only
-# when handed to caverColour, so cluster 7 gets the same colour as rank 7.
-CLUSTER_ID = re.compile(r'clid(\w+)')
- 
-def clusterId(rest):
-    match = CLUSTER_ID.search(rest)
-    return match.group(1) if match else None
- 
-# --- gather, per rank (and per cluster id, if present), the file per frame ---
-by_chl_rank = {}      # rank -> {frame: filename}, used when no file carries a clid tag
-by_cluster = {}       # cluster id (str) -> {frame: filename}, used once any file does
-by_lnk_rank = {}      # rank -> {frame: filename}
-skipped_dumps = 0
-collisions = []          # (cluster_id, frame, kept_fname, dropped_fname)
-unclustered_chl = []     # (rank, frame, fname) for chl files with no clid tag
-any_clustered = False
- 
-for fname in files:
-    frame, rest = splitFrame(fname)
-    if frame is None:
-        continue
-    chl_rank = channelRank(rest)
-    if chl_rank is not None:
-        by_chl_rank.setdefault(chl_rank, {})[frame] = fname
-        cluster = clusterId(rest)
-        if cluster is not None:
-            any_clustered = True
-            slot = by_cluster.setdefault(cluster, {})
-            if frame in slot:
-                # Two channels in the same frame landed in the same cluster --
-                # they can't both occupy one state of one multi-state object.
-                # Keep the first (by sorted filename order) and report the rest
-                # rather than silently overwriting; merging their geometry into
-                # one object is possible but is a judgement call left to you.
-                collisions.append((cluster, frame, slot[frame], fname))
-            else:
-                slot[frame] = fname
-        else:
-            # No clid tag on this particular file (a partially-clustered run,
-            # e.g. a rename pass that only tagged clustered channels and left
-            # noise/unmatched ones alone). Recorded so it isn't silently
-            # dropped once clustering mode kicks in below.
-            unclustered_chl.append((chl_rank, frame, fname))
-        continue
-    lnk_rank = linkRank(rest)
-    if lnk_rank is not None:
-        by_lnk_rank.setdefault(lnk_rank, {})[frame] = fname
-        continue
-    # rest is "" (bare "<stem><frame>.pqr") or "_links.pqr" -- the unranked
-    # per-frame dumps; skipped, same reasoning as vis_channels.py's UNRANKED
-    # handling (they duplicate the per-object files and carry no rank).
-    skipped_dumps += 1
- 
-if collisions:
-    print("Warning: %d cluster/frame collision(s) -- kept the first file, "
-          "dropped the rest:" % len(collisions))
-    for cluster, frame, kept, dropped in collisions:
-        print("  cluster %s, frame %d: kept %s, dropped %s"
-              % (cluster, frame, os.path.basename(kept), os.path.basename(dropped)))
- 
-all_frames = sorted({frame for ranks in (by_chl_rank, by_lnk_rank, by_cluster)
-                     for frame_map in ranks.values() for frame in frame_map})
-if not all_frames:
-    print("No ranked (chl/lnk) files found among the %d file(s) matched; "
-          "only bare per-frame dumps (%d skipped)." % (len(files), skipped_dumps))
-    raise SystemExit
-frame_to_state = {frame: i + 1 for i, frame in enumerate(all_frames)}
-n_states = len(all_frames)
-if any_clustered:
-    print("Found %d frame(s), %d cluster(s), %d link rank(s) "
-          "(%d unranked dump file(s) skipped)."
-          % (n_states, len(by_cluster), len(by_lnk_rank), skipped_dumps))
-else:
-    print("Found %d frame(s), %d channel rank(s), %d link rank(s) "
-          "(%d unranked dump file(s) skipped). No clid tags found -- "
-          "grouping by rank; re-run the rename pass first to group by cluster."
-          % (n_states, len(by_chl_rank), len(by_lnk_rank), skipped_dumps))
+for state_index, frame_dir in enumerate(frame_dirs, start=1):
+    if is_cif_mode:
+        cif_path = os.path.join(frame_dir, channel_pattern)
+        if not os.path.isfile(cif_path):
+            continue
+        loops = cifLoops(cif_path)
+        if "sb_ncbr_channel_profile" not in loops:
+            continue
+        columns, rows = loops["sb_ncbr_channel_profile"]
+        index = {name: columns.index(name) for name in columns}
+        samples = {}
+        for row in rows:
+            samples.setdefault(row[index["channel_id"]], []).append(
+                (float(row[index["x"]]), float(row[index["y"]]),
+                 float(row[index["z"]]), float(row[index["radius"]])))
+        for channel_id, spheres in samples.items():
+            rank = channelRank(channel_id)
+            rank = 0 if rank is None else rank
+            by_rank.setdefault(rank, {})[state_index] = (True, (channel_id, spheres))
+    else:
+        for fname in glob.glob(os.path.join(frame_dir, channel_pattern)):
+            rank = channelRank(fname)
+            if rank is None:
+                continue
+            by_rank.setdefault(rank, {})[state_index] = (False, fname)
  
 # --- build one discrete multi-state object per rank ---
 def loadPqrState(fname, tmp):
@@ -13992,85 +11401,61 @@ def loadPqrState(fname, tmp):
     if radii:
         cmd.alter(tmp, "vdw = radii.pop(0)", space={'radii': radii})
  
-def buildMultistate(rank_map, obj, colour):
-    tmp = obj + "_tmp"
+def loadCifState(channel_id, spheres, tmp):
+    text = "".join(
+        "ATOM  %5d  H   FIL T%4d    %8.3f%8.3f%8.3f%6.2f%6.2f\n"
+        % (i + 1, i + 1, x, y, z, 1.00, radius)
+        for i, (x, y, z, radius) in enumerate(spheres))
+    cmd.read_pdbstr(text, tmp)
+    radii = [radius for _, _, _, radius in spheres]
+    cmd.alter(tmp, "vdw = radii.pop(0)", space={'radii': radii})
+ 
+built = []
+for rank in sorted(by_rank):
+    obj, tmp = "chl%d" % rank, "chl%d_tmp" % rank
+    colour = caverColour(rank)
     n_written = 0
-    for frame, fname in sorted(rank_map.items()):
-        state_index = frame_to_state[frame]
-        loadPqrState(fname, tmp)
+    for state_index in range(1, n_states + 1):
+        entry = by_rank[rank].get(state_index)
+        if entry is None:
+            continue          # channel absent this frame: that state stays empty
+        is_cif, payload = entry
+        if is_cif:
+            channel_id, spheres = payload
+            loadCifState(channel_id, spheres, tmp)
+        else:
+            loadPqrState(payload, tmp)
         cmd.create(obj, tmp, 1, state_index)
         cmd.delete(tmp)
         n_written += 1
-    cmd.hide("everything", obj)
-    cmd.show("spheres", obj)
-    cmd.color(colour, obj)
-    print("  %-10s %s  present in %d/%d frame(s)" % (obj, colour, n_written, n_states))
-    return n_written
+    if n_written:
+        cmd.hide("everything", obj)
+        cmd.show("spheres", obj)
+        cmd.color(colour, obj)
+        built.append(obj)
+        print("  %-10s %s  present in %d/%d frame(s)" % (obj, colour, n_written, n_states))
  
-UNCLUSTERED = "grey60"   # for HDBSCAN's noise label, same role as vis_channels.py's UNRANKED
- 
-def clusterColour(cluster):
-    if cluster == "noise":
-        cmd.set_color("noise", [0.6, 0.6, 0.6])
-        return UNCLUSTERED
-    try:
-        return caverColour(int(cluster))
-    except ValueError:
-        # A non-numeric, non-"noise" label (a custom string tag): hash it into
-        # the palette so it's still a stable colour, just not one aligned with
-        # any particular numeric rank.
-        return caverColour(abs(hash(cluster)) % 1000)
- 
-built_chl, built_lnk = [], []
-if any_clustered:
-    # Every chl-ranked file that never got a clid tag (a partially-clustered
-    # run) still has to go somewhere: group it by its own rank, same as the
-    # no-clustering path, rather than silently losing it.
-    for rank, frame, fname in unclustered_chl:
-        by_cluster.setdefault("rank%d_untagged" % rank, {})[frame] = fname
-    for cluster in sorted(by_cluster, key=lambda c: (c == "noise", c)):
-        obj = "cl%s" % cluster
-        if buildMultistate(by_cluster[cluster], obj, clusterColour(cluster)):
-            built_chl.append(obj)
-            if cluster == "noise":
-                cmd.disable(obj)   # off by default, matching UNRANKED handling elsewhere
-else:
-    for rank in sorted(by_chl_rank):
-        obj = "chl%d" % rank
-        if buildMultistate(by_chl_rank[rank], obj, caverColour(rank)):
-            built_chl.append(obj)
-for rank in sorted(by_lnk_rank):
-    obj = "lnk%d" % rank
-    if buildMultistate(by_lnk_rank[rank], obj, caverColour(rank)):
-        built_lnk.append(obj)
- 
-if built_chl:
-    cmd.group("chnl_grp", " ".join(built_chl))
-if built_lnk:
-    cmd.group("link_grp", " ".join(built_lnk))
-    cmd.disable("link_grp")   # off by default, matching vis_channels.py's tun_grp
+if built:
+    cmd.group("chnl_grp", " ".join(built))
  
 cmd.rebuild()
 cmd.set("sphere_scale", 1.0)
 cmd.set("sphere_quality", 2)
 cmd.bg_color("white")
 cmd.zoom()
-cmd.mset("1 -%d" % n_states)
-print("Success: %d channel object(s), %d link object(s) built across %d state(s). "
+cmd.mset("1 -%d" % n_states)   # wire up the state slider / movie controls
+print("Success: %d channel object(s) built across %d state(s). "
       "Step through frames with the state slider or the movie controls." %
-      (len(built_chl), len(built_lnk), n_states))
-cmd.save('traj_ouit.pse')      
-      """
-
+      (len(built), n_states))
+'''
 
 def _writeVisScript(directory, pattern='chl*.pqr'):
     """Leave ``vis_channels.py`` in ``directory`` unless it is already there.
 
-    :func:`writePyMolCaviTracerScript` leaves the viewer beside what it writes, as
-    CAVER leaves ``view.py`` beside its clusters; a channel run itself writes no
-    script, that being what the viewer-script functions are for. An existing file
-    is never overwritten: edits made to one copy survive a rerun, and so does a
-    newer script left by an earlier one.
+    A run drops a viewer beside its output, as CAVER leaves ``view.py`` beside its
+    clusters, so the output can be opened without hunting for a script. An
+    existing file is never overwritten: edits made to one run's copy survive a
+    rerun, and so does a newer script left by an earlier one.
 
     One script serves both output formats. *pattern* is what the log tells the
     reader to pass, a glob for a PQR run and the file itself for an mmCIF one;
@@ -14100,29 +11485,28 @@ def _writeVisScript(directory, pattern='chl*.pqr'):
         LOGGER.info('Wrote the PyMOL viewer {0}. View the output with '
                     '{1}.'.format(path, usage))
 
-def _writeVisTrajScript(directory, pattern='channels*_sp*_chl*.pqr'):
+def _writeVisTrajScript(directory, pattern='chl*.pqr'):
     """Leave ``vis_channels_traj.py`` in ``directory`` unless it is already there.
 
-    Counterpart of :func:`_writeVisScript` for a run over multiple frames:
-    channel PQR files are stored together in one directory and the frame number
-    is encoded in each filename as ``channels<frame>_..._chl<channel>.pqr``.
+    Counterpart of :func:`_writeVisScript` for a run over multiple frames: it
+    goes beside the top-level directory that holds the per-frame
+    subdirectories, not inside any one of them, since it reads across all of
+    them at once.
     """
     import os
 
     path = os.path.join(str(directory), 'vis_channels_traj.py')
-
-    usage = ('`pymol vis_channels_traj.py -- "{0}" [protein.pdb]`'.format(pattern))
+    usage = ('`pymol vis_channels_traj.py -- "frame*" "{0}"`'.format(pattern))
 
     if os.path.exists(path):
         LOGGER.info('View the trajectory with the PyMOL viewer already in {0}: '
-                        '{1}.'.format(os.path.dirname(path), usage))
+                    '{1}.'.format(os.path.dirname(path), usage))
         return
     try:
         with open(path, 'w') as script_file:
             script_file.write(_VIS_CHANNELS_TRAJ_SCRIPT)
     except (IOError, OSError) as err:
-
         _warn("Could not write the PyMOL trajectory viewer {0}: {1}".format(path, err))
     else:
         LOGGER.info('Wrote the PyMOL trajectory viewer {0}. View the output with '
-                        '{1}.'.format(path, usage))
+                    '{1}.'.format(path, usage))
