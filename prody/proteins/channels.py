@@ -51,10 +51,11 @@ __all__ = ['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames',
            'buildVoxelOverlapDistanceMatrix','prepareChannelRecords',
            'compareClusterings', 'clusteringDistanceStats', 'computeBootstrapStability',
             'renameChannelFilesWithClusterLabels', 'clusterChannels',
-           'writeChannelsCIF', 'writeVmdCaviTracerScript', 'writePyMolCaviTracerScript',
-           'writeChimeraXCaviTracerScript', 'mergeFramesPQR',
+           'writeChannelsCIF', 'writePyMolCaviTracerScript',
+           'mergeFramesPQR',
            'writeChimeraXMultiModelScript', 'writePyMolMultiModelScript',
-           'writeVmdMultiModelScript']
+           'writeVmdMultiModelScript',
+           'ClusterCalculator','ClusteringRecords','Cluster']
 
 # Van der Waals radii in Angstrom, by element symbol (upper case). The radii the
 # tessellation is built on, and the ones the lining report measures a Voronoi
@@ -3500,8 +3501,7 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
 
     Example usage:
     channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
-                                    output_path="channels.pdb", separate=False, 
-                                    surf_radius=15, 
+                                    output_path="channels.pdb", separate=False, surf_radius=15, 
                                     inner_radius=1.2, min_depth=5, bottleneck=1, sparsity=6)
                                   
     channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
@@ -3634,16 +3634,9 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
     if output_path is not None and Path(output_path).is_dir() and (
             output_format == 'mmcif' or separate):
 
-        channel_pattern = (
-            'channels.cif'
-            if output_format == 'mmcif'
-            else 'channels*_sp*_chl*.pqr'
-        )
+        channel_pattern = ('channels.cif' if output_format == 'mmcif' else 'channels*_sp*_chl*.pqr')
 
-        _writeVisTrajScript(
-            output_path,
-            pattern=channel_pattern
-        )
+        _writeVisTrajScript(output_path,pattern=channel_pattern)
     elif output_path is not None and not separate and output_format != 'mmcif':
         LOGGER.info("Wrote combined channels.pqr per frame; re-run with "
                     "separate=True for a multi-state PyMOL viewer, which "
@@ -4588,6 +4581,57 @@ def _objectSampleParameters(object, num_samples=5):
     spline = object.getSplines()[0]
     return np.linspace(spline.x[0], spline.x[-1], samples)
 
+def _sampleSplineByArcLength(object, n_samples=1000):
+    """
+    Sample a Channel spline approximately uniformly in physical arc length.
+
+    Returns
+    -------
+    t : (n_samples,) ndarray
+        Spline parameters.
+    points : (n_samples, 3) ndarray
+        Centerline coordinates.
+    radii : (n_samples,) ndarray
+        Channel radii at those coordinates.
+    s : (n_samples,) ndarray
+        Cumulative arc length corresponding to the samples.
+    """
+    centerline_spline, radius_spline = object.getSplines()
+
+    if centerline_spline is None or radius_spline is None:
+        object._buildSplines()
+        centerline_spline, radius_spline = object.getSplines()
+
+    t0 = centerline_spline.x[0]
+    t1 = centerline_spline.x[-1]
+
+    if n_samples < 2:
+        n_samples = 2
+    n_dense = max(10 * n_samples, 1000)
+    td = np.linspace(t0, t1, n_dense)
+    xd = np.asarray(centerline_spline(td))
+    dx = np.diff(xd, axis=0)
+    ds = np.linalg.norm(dx, axis=1)
+    sd = np.empty(n_dense, dtype=float)
+    sd[0] = 0.0
+    sd[1:] = np.cumsum(ds)
+    total_length = sd[-1]
+
+    if total_length <= 1e-12:
+        t = np.full(n_samples, t0)
+        points = np.repeat(xd[:1], n_samples, axis=0)
+        radii = np.full(n_samples, float(radius_spline(t0)))
+        s = np.zeros(n_samples)
+        return t, points, radii, s
+
+    s = np.linspace(0.0, total_length, n_samples)
+    t = np.interp(s, sd, td)
+
+    points = np.asarray(centerline_spline(t))
+    radii = np.asarray(radius_spline(t), dtype=float)
+
+    return t, points, radii, s
+
 
 def getChannelAtoms(channels, protein=None, num_samples=5):
     """Generates an AtomGroup object representing the atoms along the paths of 
@@ -4911,7 +4955,7 @@ def _formatLiningResidues(residues, options):
     for residue in residues.getHierView().iterResidues():
         resname = (_oneLetterResname(residue) if options.one_letter_aa
                    else residue.getResname())
-        chid = residue.getChid().strip() if options.include_chain else ''   
+        chid = residue.getChid().strip() if options.include_chain else ''
         labels.append('{0}{1}{2}{3}'.format(resname, residue.getResnum(),
                                             residue.getIcode().strip(),
                                             ':' + chid if chid else ''))
@@ -5362,69 +5406,69 @@ def getObjectLiningInfo(atoms, objects, object_type='channel',
         
     return info
 
-def getObjectEssentialityScores(atoms, objects,stats_only=True, object_type='channel', **kwargs):
-    # ESSA is only scores protein residues and will not score ligands, nucleotides, waters, ions, or other objects
-    #Might update to account for cofactors,ribozymes, ect.
-    atoms = atoms.protein
-    info={}
-    z_scores = kwargs.pop('z_scores',None)
-    if not z_scores:
-        enm = kwargs.pop('enm','gnm')
-        n_modes = kwargs.pop('n_modes',10)
-        cutoff = kwargs.pop('cutoff',None)
-        lig = kwargs.pop('lig', None)
-        lowmem = kwargs.pop('lowmem',False)
-        essa=ESSA()
-        essa.setSystem(atoms,lig=lig)
-        essa.scanResidues(enm=enm,n_modes=n_modes,cutoff=cutoff,lowmem=lowmem)
-        z_scores = essa._zscore
-    if stats_only:
-        info = getObjectLiningInfo(atoms, 
-                            objects,
-                            object_type=object_type,
-                            callbacks={'SiteEssentiality':_getSiteScoreStats},
-                            scores=z_scores,
-                            **kwargs)
-    else:
-        info = getObjectLiningInfo(atoms, 
-                                    objects,
-                                    object_type=object_type,
-                                    callbacks={'SiteEssentiality':_getSiteScores},
-                                    scores=z_scores,
-                                    **kwargs)
-    return info
+# def getObjectEssentialityScores(atoms, objects,stats_only=True, object_type='channel', **kwargs):
+#     # ESSA is only scores protein residues and will not score ligands, nucleotides, waters, ions, or other objects
+#     #Might update to account for cofactors,ribozymes, ect.
+#     atoms = atoms.protein
+#     info={}
+#     z_scores = kwargs.pop('z_scores',None)
+#     if not z_scores:
+#         enm = kwargs.pop('enm','gnm')
+#         n_modes = kwargs.pop('n_modes',10)
+#         cutoff = kwargs.pop('cutoff',None)
+#         lig = kwargs.pop('lig', None)
+#         lowmem = kwargs.pop('lowmem',False)
+#         essa=ESSA()
+#         essa.setSystem(atoms,lig=lig)
+#         essa.scanResidues(enm=enm,n_modes=n_modes,cutoff=cutoff,lowmem=lowmem)
+#         z_scores = essa._zscore
+#     if stats_only:
+#         info = getObjectLiningInfo(atoms, 
+#                             objects,
+#                             object_type=object_type,
+#                             callbacks={'SiteEssentiality':_getSiteScoreStats},
+#                             scores=z_scores,
+#                             **kwargs)
+#     else:
+#         info = getObjectLiningInfo(atoms, 
+#                                     objects,
+#                                     object_type=object_type,
+#                                     callbacks={'SiteEssentiality':_getSiteScores},
+#                                     scores=z_scores,
+#                                     **kwargs)
+#     return info
 
-def getObjectEffectivenessSensitivity(atoms, objects,prs_data = None,stats_only=True, object_type='channel', **kwargs):
+# def getObjectEffectivenessSensitivity(atoms, objects,prs_data = None,stats_only=True, object_type='channel', **kwargs):
     
 
-    info={}
-    effectivness = None
-    sensitivity = None
-    if prs_data:
-        prs_matrix,effectiveness,sensitivity = prs_data
-    else:
-        enm = kwargs.pop('enm','anm')
-        n_modes = kwargs.pop('n_modes','all')
-        model, atomsca = calcENM(atoms, select='calpha',model=enm,n_modes=n_modes,trim='trim')
-        prs_matrix,effectiveness,sensitivity = calcPerturbResponse(model, atoms = atomsca)       
+#     info={}
+#     effectivness = None
+#     sensitivity = None
+#     if prs_data:
+#         prs_matrix,effectiveness,sensitivity = prs_data
+#     else:
+#         enm = kwargs.pop('enm','anm')
+#         n_modes = kwargs.pop('n_modes','all')
+#         model, atomsca = calcENM(atoms, select='calpha',model=enm,n_modes=n_modes,trim='trim')
+#         prs_matrix,effectiveness,sensitivity = calcPerturbResponse(model, atoms = atomsca)       
         
-    if stats_only:
-        info = getObjectLiningInfo(atoms, 
-                            objects,
-                            object_type=object_type,
-                            callbacks={'PRScores':_getSiteScoreStats},
-                            scores={'effectiveness':effectiveness,
-                                   'sensitivity':sensitivity},
-                            **kwargs)
-    else:
-        info = getObjectLiningInfo(atoms, 
-                                    objects,
-                                    object_type=object_type,
-                                    callbacks={'PRScores':_getSiteScores},
-                                    scores={'effectiveness':effectiveness,
-                                   'sensitivity':sensitivity},
-                                    **kwargs)
-    return info
+#     if stats_only:
+#         info = getObjectLiningInfo(atoms, 
+#                             objects,
+#                             object_type=object_type,
+#                             callbacks={'PRScores':_getSiteScoreStats},
+#                             scores={'effectiveness':effectiveness,
+#                                    'sensitivity':sensitivity},
+#                             **kwargs)
+#     else:
+#         info = getObjectLiningInfo(atoms, 
+#                                     objects,
+#                                     object_type=object_type,
+#                                     callbacks={'PRScores':_getSiteScores},
+#                                     scores={'effectiveness':effectiveness,
+#                                    'sensitivity':sensitivity},
+#                                     **kwargs)
+#     return info
 
 
 def getObjectResidueNames(atoms, channels, **kwargs):
@@ -11244,7 +11288,6 @@ class ChannelCalculator:
                             float(search_radius)))
 
 
-
     def trimCavitiesByDepth(self, cavities, max_depth):
         """Filtering cavities by max_depth."""
     
@@ -11674,7 +11717,6 @@ def clusterChannels(distance_matrix, method, records, **kwargs):
         If the required scikit-learn clustering class is unavailable.
     """
     labels = []
-    clustercalc = ClusterCalculator()
     from scipy.sparse import csr_matrix
     distance_matrix = np.asarray(distance_matrix) if not kwargs.get('sparse', False) else distance_matrix
 
@@ -11703,79 +11745,97 @@ def clusterChannels(distance_matrix, method, records, **kwargs):
             from sklearn.cluster import HDBSCAN
         except ImportError as exc:
             raise ImportError(
-                "HDBSCAN requires scikit-learn>=1.3. Install/upgrade with `pip install -U scikit-learn`."
+                "HDBSCAN requires scikit-learn"
             ) from exc
 
         # Sensible defaults; anything the caller passes in kwargs overrides these.
         kwargs.setdefault('metric', 'precomputed')
         try:
-            hdb = HDBSCAN(**kwargs)
-            hdb.fit(distance_matrix)
+            model= HDBSCAN(**kwargs)
+            model.fit(distance_matrix)
         except Exception as exc:
             raise RuntimeError(f"HDBSCAN fitting failed: {exc}") from exc
-        labels = hdb.labels_
+        labels = model.labels_
 
     elif method == 'DBSCAN':
         try:
             from sklearn.cluster import DBSCAN
         except ImportError as exc:
-            raise ImportError("DBSCAN requires scikit-learn. Install with `pip install -U scikit-learn`.") from exc
+            raise ImportError("DBSCAN requires scikit-learn") from exc
 
         kwargs.setdefault('metric', 'precomputed')
         kwargs.setdefault('eps', 0.5)
         kwargs.setdefault('min_samples', 5)
         try:
-            db = DBSCAN(**kwargs)
-            db.fit(distance_matrix)
+            model = DBSCAN(**kwargs)
+            model.fit(distance_matrix)
         except Exception as exc:
             raise RuntimeError(f"DBSCAN fitting failed: {exc}") from exc
-        labels = db.labels_
+        labels = model.labels_
 
     elif method == 'agglomerative':
         try:
             from sklearn.cluster import AgglomerativeClustering
-        except ImportError as exc:
-            raise ImportError("AgglomerativeClustering requires scikit-learn. Install with `pip install -U scikit-learn`.") from exc
+            backend = 'sklearn'
+        except ImportError:
+            try:
+                from scipy.cluster.hierarchy import linkage, fcluster
+                from scipy.spatial.distance import squareform
+                backend = 'scipy'
+            except ImportError as exc:
+                raise ImportError("AgglomerativeClustering requires scikit-learn or scipy") from exc
             
-        distance_threshold = kwargs.pop('distance_threshold', 0.4) #0.4 assumes dist scale 0-1
-        linkage = kwargs.pop('linkage', 'average')
+        if backend == 'sklearn':
+            distance_threshold = kwargs.pop('distance_threshold', 0.4) #0.4 assumes dist scale 0-1
+            linkage = kwargs.pop('linkage', 'average')
 
-        # distance_threshold and n_clusters are mutually exclusive in sklearn;
-        # if the caller supplied a distance_threshold, n_clusters must be None.
-        if 'n_clusters' in kwargs and kwargs['n_clusters'] is not None:
-            distance_threshold = None
+            # distance_threshold and n_clusters are mutually exclusive in sklearn;
+            # if the caller supplied a distance_threshold, n_clusters must be None.
+            if 'n_clusters' in kwargs and kwargs['n_clusters'] is not None:
+                distance_threshold = None
+            else:
+                n_clusters=None
+            try:
+                model = AgglomerativeClustering(
+                    distance_threshold=distance_threshold,
+                    n_clusters=n_clusters,
+                    metric='precomputed',
+                    linkage=linkage,
+                    compute_distances=True,
+                    **kwargs,
+                )
+                model.fit(distance_matrix)
+            except Exception as exc:
+                raise RuntimeError(f"AgglomerativeClustering fitting failed: {exc}") from exc
+            labels = model.labels_
         else:
-            n_clusters=None
-        try:
-            agg = AgglomerativeClustering(
-                distance_threshold=distance_threshold,
-                n_clusters=n_clusters,
-                metric='precomputed',
-                linkage=linkage,
-                compute_distances=True,
-                **kwargs,
-            )
-            agg.fit(distance_matrix)
-        except Exception as exc:
-            raise RuntimeError(f"AgglomerativeClustering fitting failed: {exc}") from exc
-        labels = agg.labels_
-
+            method= kwargs.pop('method', 'average')
+            criterion = kwargs.pop('criterion', 'distance')
+            distance_threshold = kwargs.pop('distance_threshold', 0.4)
+            condensed = squareform(distance_matrix)
+            linkage_matrix = linkage(condensed,method=method)
+            labels = fcluster(linkage_matrix, distance_threshold, criterion=criterion)
+            model = 'scipy_hierarchical'
+            
     for rec,label in zip(records,labels):
-        rec.cluter_ids.append(label)
+        rec.cluster_ids.append(label)
     p = np.argsort(labels)
-    sorted_recs = records[p]
+    sorted_recs = np.asarray(records,dtype=object)[p]
     unique, counts = np.unique(labels, return_counts=True)
     k=len(unique)
-    clusters = np.empty(k,dtype=clustercalc.Cluster)
+    clusters = np.empty(k,dtype=Cluster)
     start = 0
-    for label, count in zip(range(k),unique,counts):
+    for label, count in zip(unique,counts):
         end = start + count
         recs = sorted_recs[start:end]
-        clusters[k] = clustercalc.Cluster(label,recs)
-        clusters[k]._calcInternalDistanceMatrix(distance_matrix,labels)
-        clusters[k]._calcClusterStats(labels)
+        clusters[label] = Cluster(label,recs)
+        clusters[label]._calcInternalDistanceMatrix(distance_matrix,labels)
+        clusters[label]._calcClusterStats(labels)
         start = end
-    clustering = clustercalc.ClusteringRecords(clusters,labels,distance_matrix)
+    clustering = ClusteringRecords(model,records,clusters,labels,distance_matrix)
+    if isinstance(model,str):
+        if model == 'scipy_hierarchical':
+            clustering.linkage_matrix = linkage_matrix
     return labels, clustering 
 
 def renameChannelFilesWithClusterLabels(channels, labels, output_path,
@@ -12072,6 +12132,159 @@ def compareClusterings(labels1,labels2):
     return {"ARI": adjusted_rand_score(labels1, labels2),
             "AMI": adjusted_mutual_info_score(labels1, labels2)}
 
+import numpy as np
+
+
+def writeClusterLabels(filename, labels, names=None):
+    """
+    Write one or more clustering label sets to a tab-separated text file.
+
+    Parameters
+    ----------
+    filename : str or os.PathLike
+        Output filename. A '.tsv' extension is recommended.
+
+    labels : array-like or sequence of array-like
+        Cluster labels to write.
+
+        For a single clustering, this may be a 1-D array of shape
+        ``(n_channels,)``.
+
+        For multiple clusterings, this may be either:
+
+        - a sequence of 1-D arrays, one array per clustering, or
+        - a 2-D NumPy array of shape ``(n_channels, n_clusterings)``.
+
+        All clustering label sets must contain the same number of channels.
+
+    names : sequence of str, optional
+        Column names for the clustering label sets. The number of names must
+        equal the number of clustering columns. If omitted, names are generated
+        as ``labels_1``, ``labels_2``, etc.
+
+    Returns
+    -------
+    str
+        The output filename.
+
+    Notes
+    -----
+    Label -1 is conventionally used for noise/unclustered channels.
+
+    Rows must be in the same channel order expected by the PyMOL
+    visualization script: ascending frame followed by ascending channel rank
+    within each frame.
+    """
+
+    if isinstance(labels, np.ndarray) and labels.ndim == 1:
+        arr = labels[:, None]
+
+    elif isinstance(labels, np.ndarray) and labels.ndim == 2:
+        arr = labels
+
+    else:
+        label_sets = [np.asarray(x) for x in labels]
+
+        if not label_sets:
+            raise ValueError("At least one label set must be supplied.")
+
+        if any(x.ndim != 1 for x in label_sets):
+            raise ValueError("Each label set must be one-dimensional.")
+
+        lengths = {len(x) for x in label_sets}
+        if len(lengths) != 1:
+            raise ValueError("All label sets must contain the same number of channels.")
+
+        arr = np.column_stack(label_sets)
+
+    if arr.ndim != 2:
+        raise ValueError("Labels must form a 2-D label table.")
+
+    n_channels, n_clusterings = arr.shape
+
+    if names is None:
+        names = ["labels_%d" % (i + 1) for i in range(n_clusterings)]
+    else:
+        names = list(names)
+
+    if len(names) != n_clusterings:
+        raise ValueError("Received %d column names for %d clustering label sets." % (len(names), n_clusterings))
+
+    try:
+        arr = arr.astype(int)
+    except (TypeError, ValueError):
+        raise ValueError("All cluster labels must be integers.")
+
+    with open(filename, "w") as out:
+        out.write("# " + "\t".join(map(str, names)) + "\n")
+        for row in arr:
+            out.write("\t".join(map(str, row)) + "\n")
+    return str(filename)
+
+
+def _unit(v):
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-12 else v
+
+
+def _cached(obj, key, build):
+    cache = obj.__dict__.setdefault("_dist_cache", {})
+    if key not in cache:
+        cache[key] = build()
+    return cache[key]
+
+
+def _arc(obj, n):
+    """(t, p, r, s, kd-tree) arc-length samples, cached."""
+    ch = getattr(obj, "channel", obj)
+    t, p, r, s = _cached(obj, ("arc", n), lambda: _sampleSplineByArcLength(ch, n))
+    p = np.asarray(p)
+    tree = _cached(obj, ("arc_tree", n), lambda: _kdTree(p)) if len(p) else None
+    return t, p, r, s, tree
+
+
+def _dense(obj, n_dense):
+    """(spline, t, points, unit tangents, kd-tree) dense samples of the spline, cached."""
+    spline = getattr(obj, "channel", obj).getSplines()[0]
+
+    def build():
+        td = np.linspace(spline.x[0], spline.x[-1], n_dense)
+        pd = np.asarray(spline(td))
+        return td, pd, _unit(spline(td, 1)), _kdTree(pd)
+
+    return (spline,) + _cached(obj, ("dense", n_dense), build)
+  
+def _frechetTable(D, full=False):
+    """
+    Discrete Frechet distance from a point-distance matrix D (na x nb); with
+    full=True returns the whole (na, nb) coupling table (needed for the path).
+ 
+    Same recurrence as the double loop, swept one anti-diagonal at a time on a
+    skewed copy of D (S[k, i] = D[i, k-i]) so every step is a few contiguous-slice
+    numpy ops with no fancy indexing: na+nb steps instead of na*nb iterations.
+    """
+    na, nb = D.shape
+    I, K = np.arange(na)[None, :], np.arange(na + nb - 1)[:, None]
+    J = K - I
+    S = np.where((J >= 0) & (J < nb), D[I, np.clip(J, 0, nb - 1)], np.inf)
+    p2 = np.full(na + 1, np.inf)            # diagonal k-2; index i+1 holds cell i, index 0 stays inf
+    p1 = np.full(na + 1, np.inf)
+    p1[1] = S[0, 0]                         # cell (0, 0)
+    rows = [p1[1:].copy()] if full else None
+    tmp = np.empty(na)
+    for k in range(1, na + nb - 1):
+        cur = np.full(na + 1, np.inf)
+        np.minimum(p1[1:], p1[:-1], out=tmp)        # (i, j-1) and (i-1, j)
+        np.minimum(tmp, p2[:-1], out=tmp)           # (i-1, j-1)
+        np.maximum(S[k], tmp, out=cur[1:])
+        if full:
+            rows.append(cur[1:].copy())
+        p2, p1 = p1, cur
+    if not full:
+        return float(p1[na])                # cell (na-1, nb-1) is on the last diagonal
+    ii, jj = np.indices((na, nb))
+    return np.array(rows)[ii + jj, ii]
+
 class ClusterCalculator:
     
     def __init__(self, atoms=None, voxel_size=0.25,pad_factor=1.02,h=10,angle_deg=5.0,
@@ -12096,7 +12309,7 @@ class ClusterCalculator:
         def __init__(self,calculator, channel, conformation_id, lining_residues = None, rep_points=None,
                     rep_radii=None, centerline_points=None,centerline_radii=None,
                     tree=None,bbox=None,mask=None,offset=None,dims=None,volume=None,
-                    endpoint=None,r_T=None,kept=True,cluster_ids=[],shell_weights=None):
+                    endpoint=None,r_T=None,kept=True,cluster_ids=None,shell_weights=None):
 
             if not channel.getSplines()[0]:
                 channel._buildSplines()
@@ -12121,7 +12334,7 @@ class ClusterCalculator:
             self.endpoint = endpoint
             self.r_T = r_T
             self.kept = kept
-            self.cluster_ids = cluster_ids
+            self.cluster_ids = [] if cluster_ids is None else cluster_ids
             self.shell_weights = shell_weights
             self.voxelized = False
             self.__postInit__()
@@ -12189,284 +12402,103 @@ class ClusterCalculator:
         channel, conformation_id, voxelize = args
         return self._buildChannelRecord(channel, conformation_id, voxelize=voxelize)
     
+    class DendrogramStability:
+        """
+        Precomputes everything needed to score any dendrogram node in O(1).
 
-    class Cluster:
-        def __init__(self, label, records, details=None, depth=0):
-            self.label = label
-            self.records = records
-            self.details = details if details is not None else {}   # was a shared mutable default
-            self.conformation_ids = [rec.conformation_id for rec in records]
-            self.approximated = None
-            self.soft_assigned = None
-            self.size = len(records)
-            self.depth = depth
-            self.persistence = None
-            self.mediod = None              # GLOBAL index into the fitted subsample
-            self.mean_pairwise_distance = None
-            self.density = None
-            self.max_nearest_neighbor_distance = None
-            self.internal_distance_matrix = None
-            self.mean_probability = None    # only if hdbscan
-            self.voxelized_graph = None
-            self.graph_occupancy = None
-            self.subclusters = None #ClusterCalculator.ClusteringRecords()
-            # set by ClusteringRecords.fit(); refer to the ORIGINAL subsample,
-            # so they stay valid after extendCluster()
-            self.rep_idx = None             # subsample indices of representatives
-            self.rep_threshold = None       # acceptance radius computed on the reps
+        Parameters
+        ----------
+        Z : (n-1, 4) linkage matrix
+        leaf_weight : optional (n,) array; leaves with weight <= 0 are ignored
+            (noise points). Default: all leaves count.
+        condense_size : int
+            A sub-branch must hold at least this many counted points to count as
+            a genuine split; smaller branches are treated as points falling out
+            (HDBSCAN's condensing step).
 
+        Attributes (all indexed by node id, leaves are 0..n-1)
+        ----------
+        raw    : (n-1,) merge heights made monotone (index = node - n)
+        dist   : raw floored to a small positive value (safe for logs / 1/d)
+        ncl    : counted leaves below each node
+        parent : parent node id or -1
+        """
 
-        @property
-        def _threshold(self):
-            if self.rep_threshold is not None:
-                return self.rep_threshold
-            return max(self.mean_pairwise_distance, self.max_nearest_neighbor_distance)
+        def __init__(self, Z, leaf_weight=None, condense_size=3):
+            Z = np.asarray(Z, dtype=float)
+            n = Z.shape[0] + 1
+            self.n = n
+            self.left = Z[:, 0].astype(int)
+            self.right = Z[:, 1].astype(int)
+            raw = Z[:, 2].copy()
+            # Enforce monotone heights (centroid/median linkage can invert).
+            for i in range(n - 1):
+                for c in (self.left[i], self.right[i]):
+                    if c >= n:
+                        raw[i] = max(raw[i], raw[c - n])
+            self.raw = raw
+            pos = raw[raw > 0]
+            self.floor = 0.5 * pos.min() if pos.size else 1e-12
+            self.dist = np.maximum(raw, self.floor)
+            self.condense_size = max(1, int(condense_size))
 
-        def _resetStats(self):
-            self.persistence = None
-            self.mediod = None
-            self.mean_pairwise_distance = None
-            self.density = None
-            self.max_nearest_neighbor_distance = None
-            self.internal_distance_matrix = None
-            self.mean_probability = None
-            self.voxelized_graph = None
-            self.graph_occupancy = None
-
-        def extendCluster(self,records):
-            records = list(records)
-            self.records = list(self.records) + records
-            self.conformation_ids.extend(rec.conformation_id for rec in records)
-            self.approximated = True
-            self.size = len(self.records)
-            self._resetStats()
-
-
-        def _calcInternalDistanceMatrix(self,distance_matrix,labels):
-            D = np.asarray(distance_matrix)
-            labels = np.asarray(labels)
-            idx = np.flatnonzero(labels == self.label)
-            if len(idx) == 0:
-                raise ValueError("Cluster {0} does not exist.".format(self.label))
-            Dc = D[np.ix_(idx, idx)]
-            self.internal_distance_matrix = Dc
-        
-        def _calcPersistance(self,num_conformations):
-            self.persistance = self.size/num_conformations
-
-        def _calcClusterStats(self,labels):
-            labels = np.asarray(labels)
-            idx = np.flatnonzero(labels == self.label)
-            n = len(idx)            # not self.size: size grows after extendCluster()
-            Dc = self.internal_distance_matrix
-            self.mediod = int(idx[np.argmin(Dc.sum(axis=1))])
-            if n > 1:
-                upper = Dc[np.triu_indices(n, k=1)]
-
-                mean_pairwise_distance = upper.mean()
+            total = 2 * n - 1
+            self.parent = np.full(total, -1, dtype=int)
+            self.ncl = np.zeros(total, dtype=int)
+            if leaf_weight is None:
+                self.ncl[:n] = 1
             else:
-                mean_pairwise_distance = 0.0
-            self.mean_pairwise_distance = mean_pairwise_distance
-            # For every point, find its closest OTHER point in the cluster.
-            # Then take the largest of those nearest-neighbor distances.
-            if n > 1:
-                Dc_no_diag = Dc.copy()
-                np.fill_diagonal(Dc_no_diag, np.inf)
-                nearest_neighbor_distances = Dc_no_diag.min(axis=1)
-                self.max_nearest_neighbor_distance = nearest_neighbor_distances.max()
-            else:
-                self.max_nearest_neighbor_distance = 0.0
-            # Here density is defined as inverse mean pairwise distance.
-            # Higher = more compact.
-            if n > 1 and mean_pairwise_distance > 0:
-                self.density = 1.0 / mean_pairwise_distance
-            else:
-                self.density = np.inf
+                self.ncl[:n] = (np.asarray(leaf_weight) > 0).astype(int)
 
-
-
-        # def _buildVoxelizedGraph(self):
-
-        #     self.graph = graph
-
-        
-        # def _calcOccupancies(self):
-        #     if not self.voxelized_graph:
-        #         self._buildVoxelizedGraph()
-        #     self.graph_occupancy = occupancy
-
-
-    class ClusteringRecords:
-        def __init__(self,clusters, labels, distance_matrix, levels=[0]):
-            self.clusters = clusters
-            self.labels = labels
-            self.distance_matrix = distance_matrix
-            self.num_clusters = len(clusters)
-            self.levels = levels
-            self.between_distances = None
-            self.approximated = False
-            self._by_label = {}
-            self._n_sub = len(self.labels)
-            self._fitted = False
-
-        def getClusterByLabel(self,label):
-            for cluster in self.clusters:
-                if cluster.label == label:
-                    return cluster
-            LOGGER.warn('No Cluster With Label {0} found'.format(label))
-            return None
-
-        def fit(self, max_reps_per_cluster=500, random_state=123, keep_internal=True):
-            """Choose representatives and an acceptance threshold per cluster,
-            using only the (n_sub, n_sub) distance matrix.
-
-            Cluster-level stats (medoid etc.) are computed here if the Cluster
-            doesn't have them yet. Representatives are a random subset that
-            always includes the medoid.
-            """
-            D = np.asarray(self.distance_matrix, dtype=float)
-            if D.ndim != 2 or D.shape[0] != D.shape[1]:
-                raise ValueError("distance_matrix must be square (n_sub, n_sub)")
-            if D.shape[0] != len(self.labels):
-                raise ValueError("distance_matrix size must match len(labels)")
-
-            rng = np.random.default_rng(random_state)
-            self._n_sub = D.shape[0]
-            self._by_label = {}
-
-            for cluster in self.clusters:
-                member_idx = np.flatnonzero(self.labels == cluster.label)
-                if len(member_idx) == 0:
-                    LOGGER.warn('Cluster {0} has no members in labels'.format(cluster.label))
+            W = np.zeros(total)   # points counted
+            A = np.zeros(total)   # sum w * log(d_shed)
+            B = np.zeros(total)   # sum w / d_shed
+            cond = self.condense_size
+            for i in range(n - 1):
+                v, a, b, d = n + i, self.left[i], self.right[i], self.dist[i]
+                self.parent[a] = self.parent[b] = v
+                self.ncl[v] = self.ncl[a] + self.ncl[b]
+                big_a, big_b = self.ncl[a] >= cond, self.ncl[b] >= cond
+                if big_a and big_b:               # genuine split: cluster ends
+                    w = self.ncl[v]
+                    W[v], A[v], B[v] = w, w * np.log(d), w / d
                     continue
+                for ch, big in ((a, big_a), (b, big_b)):
+                    if big:                        # keep following the big branch
+                        W[v] += W[ch]; A[v] += A[ch]; B[v] += B[ch]
+                    elif self.ncl[ch] > 0:         # small branch falls out here
+                        w = self.ncl[ch]
+                        W[v] += w; A[v] += w * np.log(d); B[v] += w / d
+            self.W, self.A, self.B = W, A, B
 
-                if cluster.internal_distance_matrix is None or cluster.mediod is None:
-                    cluster._calcInternalDistanceMatrix(D, self.labels)
-                    cluster._calcClusterStats(self.labels)
+        def height(self, node):
+            return self.raw[node - self.n] if node >= self.n else 0.0
 
-                n = len(member_idx)
-                # cluster.mediod is a global index -> position within this cluster
-                medoid_local = int(np.flatnonzero(member_idx == cluster.mediod)[0])
+        def stability(self, node, ext):
+            """(log-stability, 1/d-stability) of `node` born at height `ext`."""
+            e = max(float(ext), self.floor)
+            return (self.W[node] * np.log(e) - self.A[node],
+                    self.B[node] - self.W[node] / e)
+        
+    def stabilityNoiseDecision(size, stability, ratio, min_cluster_size,
+                                min_persistence_ratio, singleton_noise=True,
+                                min_ratio_floor=1.0):
+        """
+        Shared noise rule. A cluster is kept if
 
-                if max_reps_per_cluster is not None and n > max_reps_per_cluster:
-                    others = np.delete(np.arange(n), medoid_local)
-                    pick = rng.choice(others, size=max_reps_per_cluster - 1, replace=False)
-                    rep_local = np.concatenate([[medoid_local], pick])
-                else:
-                    rep_local = np.arange(n)
-                rep_idx = member_idx[rep_local]
+            stability >= min_cluster_size * log(min_persistence_ratio)
 
-                if len(rep_idx) > 1:
-                    D_rep = D[np.ix_(rep_idx, rep_idx)]          # fancy indexing copies
-                    mean_pw = float(D_rep[np.triu_indices(len(rep_idx), k=1)].mean())
-                    np.fill_diagonal(D_rep, np.inf)
-                    max_nn = float(D_rep.min(axis=1).max())
-                else:
-                    mean_pw, max_nn = 0.0, 0.0
-
-                cluster.rep_idx = rep_idx
-                cluster.rep_threshold = max(mean_pw, max_nn)
-                cluster.approximated = len(rep_idx) < n
-                if not keep_internal:
-                    cluster.internal_distance_matrix = None
-
-                self._by_label[int(cluster.label)] = cluster
-
-            self.num_clusters = len(self._by_label)
-            self.approximated = True
-            self._fitted = True
-            return self
-
-        def _checkFitted(self):
-            if not self._fitted or not self._by_label:
-                raise RuntimeError("call fit() first")
-
-        @staticmethod
-        def _batches(new_to_sub, n_new, batch_size):
-            for start in range(0, n_new, batch_size):
-                end = min(start + batch_size, n_new)
-                block = new_to_sub(start, end) if callable(new_to_sub) else new_to_sub[start:end]
-                yield start, end, np.asarray(block, dtype=float)
-
-        def _nNew(self, new_to_sub, n_new):
-            if callable(new_to_sub):
-                if n_new is None:
-                    raise ValueError("n_new is required when new_to_sub is a callable")
-                return n_new
-            return len(new_to_sub)
-
-        def _distToClusters(self, block, labels_list):
-            """(b, n_sub) block -> (b, k): min distance to each cluster's reps."""
-            if block.shape[1] != self._n_sub:
-                raise ValueError(f"expected {self._n_sub} columns (one per subsample "
-                                 f"point), got {block.shape[1]}")
-            return np.stack([block[:, self._by_label[l].rep_idx].min(axis=1)
-                             for l in labels_list], axis=1)
-
-        def assign(self, new_to_sub, n_new=None, batch_size=2000, strict=True,
-                   slack=1.0, atol=1e-9):
-            """Hard-assign new points; -1 = unassigned. See earlier docstring."""
-            self._checkFitted()
-            n = self._nNew(new_to_sub, n_new)
-            labels_list = list(self._by_label)
-            lbl_arr = np.array(labels_list)
-            thr = np.array([self._by_label[l]._threshold for l in labels_list]) * slack
-            thr = np.where(thr == 0.0, atol, thr)
-
-            out = np.full(n, -1, dtype=int)
-            for start, end, block in self._batches(new_to_sub, n, batch_size):
-                d = self._distToClusters(block, labels_list)
-                best_j = d.argmin(axis=1)
-                best_d = d[np.arange(len(d)), best_j]
-                accept = np.ones(len(d), bool) if not strict else best_d <= thr[best_j]
-                out[start:end] = np.where(accept, lbl_arr[best_j], -1)
-            return out
-
-        def softAssign(self, new_to_sub, n_new=None, max_distance=None,
-                       bandwidth=None, top_k=None, batch_size=2000):
-            """Soft-assign borderline points. Returns (labels_list, probs)."""
-            self._checkFitted()
-            n = self._nNew(new_to_sub, n_new)
-            labels_list = list(self._by_label)
-            k = len(labels_list)
-
-            thr = np.array([self._by_label[l]._threshold for l in labels_list])
-            thr = thr[thr > 0]
-            if max_distance is None:
-                max_distance = float(2.0 * thr.max()) if thr.size else 1.0
-            if bandwidth is None:
-                bandwidth = max(float(np.median(thr)) if thr.size else 1.0, 1e-6)
-
-            probs = np.zeros((n, k))
-            for start, end, block in self._batches(new_to_sub, n, batch_size):
-                d = self._distToClusters(block, labels_list)
-                w = np.where(d <= max_distance, np.exp(-d / bandwidth), 0.0)
-
-                if top_k is not None and top_k < k:
-                    keep = np.argpartition(-w, top_k - 1, axis=1)[:, :top_k]
-                    mask = np.zeros_like(w, dtype=bool)
-                    np.put_along_axis(mask, keep, True, axis=1)
-                    w = np.where(mask, w, 0.0)
-
-                s = w.sum(axis=1, keepdims=True)
-                probs[start:end] = np.divide(w, s, out=np.zeros_like(w), where=s > 0)
-            return labels_list, probs
-
-        def extend(self, new_records, new_to_sub, batch_size=2000, strict=True, slack=1.0):
-            """Hard-assign new ChannelRecords and add them to their Clusters via
-            Cluster.extendCluster(). Returns the labels (-1 = left unassigned)."""
-            new_records = list(new_records)
-            labels = self.assign(new_to_sub, n_new=len(new_records),
-                                 batch_size=batch_size, strict=strict, slack=slack)
-            for lbl in np.unique(labels):
-                if lbl == -1:
-                    continue
-                members = [new_records[i] for i in np.flatnonzero(labels == lbl)]
-                self._by_label[int(lbl)].extendCluster(members)
-            return labels
-
-
-
+        i.e. it persists at least as much as `min_cluster_size` points each
+        surviving at the minimum ratio. Bigger clusters therefore need a smaller
+        per-point ratio, smaller ones a larger one.
+        """
+        if singleton_noise and size == 1:
+            return True
+        if stability is None or np.isnan(stability):      # nothing to separate from
+            return size < min_cluster_size
+        threshold = min_cluster_size * np.log(min_persistence_ratio)
+        return bool(stability < threshold) or (
+            np.isfinite(ratio) and ratio < min_ratio_floor)
 
 ##### Bounding Box Functions #####
     def channelBoundBox(self,channel):
@@ -12496,6 +12528,7 @@ class ClusterCalculator:
 
         return np.all(hi > lo, axis=-1)                       # (m, k)
 ##### Bounding Box Functions #####
+
 
 
 ##### Functions Related to the Channel Lining Residue Pipeline #####
@@ -12709,10 +12742,6 @@ class ClusterCalculator:
 
 
 ##### Functions Related to the Center Sampling Pipeline #####
-
-    def _unit(self, v):
-        n = np.linalg.norm(v)
-        return v / n if n > 1e-12 else v
 
 
     def computeAverageStart(self,records):
@@ -13062,13 +13091,1451 @@ class ClusterCalculator:
         for r, t in zip(records, throughputs):
             r.channel.throughput = float(t)
 
-##### Functions Related to the Center Sampling Pipeline #####
+##### centerline sampleing functions######
+
+####### POST CLUSTERING METRICS #######
+    @staticmethod
+    def symmetricChamferDistance(channel_a, channel_b, n_samples=300, return_details=False):
+        """
+        Symmetric mean closest-centerline distance between two channels
+        (Channel or ChannelRecord). Samples are uniform in arc length, so the
+        plain mean approximates the length-weighted mean.
+        """
+        _, pa, _, _, tree_a = _arc(channel_a, n_samples)
+        _, pb, _, _, tree_b = _arc(channel_b, n_samples)
+
+        if len(pa) == 0 or len(pb) == 0:
+            return (np.inf, {}) if return_details else np.inf
+
+        d_ab, idx_ab = tree_b.query(pa, k=1)
+        d_ba, idx_ba = tree_a.query(pb, k=1)
+
+        mean_ab = float(np.mean(d_ab))
+        mean_ba = float(np.mean(d_ba))
+        distance = 0.5 * (mean_ab + mean_ba)
+
+        if not return_details:
+            return float(distance)
+
+        return float(distance), {
+            "distance": float(distance),
+            "a_to_b_mean": mean_ab, "b_to_a_mean": mean_ba,
+            "a_to_b_median": float(np.median(d_ab)), "b_to_a_median": float(np.median(d_ba)),
+            "a_to_b_q90": float(np.percentile(d_ab, 90)), "b_to_a_q90": float(np.percentile(d_ba, 90)),
+            "a_to_b_max": float(np.max(d_ab)), "b_to_a_max": float(np.max(d_ba)),
+            "a_to_b_distances": d_ab, "b_to_a_distances": d_ba,
+            "a_to_b_indices": idx_ab, "b_to_a_indices": idx_ba,
+        }
+    
+    @staticmethod
+    def splineProjectionDistance(channel_a, channel_b,
+                                 n_samples=300,
+                                 angle_threshold_deg=60.0,
+                                 n_dense=1000,
+                                 n_candidates=8,
+                                 return_details=False):
+        """
+        Mean distance from arc-length samples of the shorter channel to the
+        continuous spline of the longer one.
+ 
+        A dense KD-tree lookup gives every sample's starting point at once; each
+        is then refined by projecting onto the two neighbouring dense segments
+        and evaluating the spline once at the result. Everything is vectorized
+        (no per-point Python loop); n_dense sets the accuracy (chord error is
+        ~ spacing^2 * curvature / 8, about 1e-4 A at the default).
+ 
+        angle_threshold_deg : among the `n_candidates` nearest dense points use
+            the nearest whose tangent (direction-agnostic) is within this angle
+            of the reference tangent; otherwise fall back to the plain nearest.
+            None disables the constraint.
+        """
+        la = getattr(channel_a, "channel", channel_a).length
+        lb = getattr(channel_b, "channel", channel_b).length
+        short, long_ = (channel_a, channel_b) if la <= lb else (channel_b, channel_a)
+        short_ch = getattr(short, "channel", short)
+ 
+        ts, ps, rs, ss, _ = _arc(short, n_samples)
+        n = len(ps)
+        if n == 0:
+            return (np.inf, {}) if return_details else np.inf
+ 
+        spline, td, pd, tan_dense, tree = _dense(long_, n_dense)
+        tan_a = _cached(short, ("arc_tan", n_samples),
+                        lambda: _unit(short_ch.centerline_spline(ts, 1)))
+ 
+        # initial correspondence (optionally tangent-constrained)
+        use_angle = angle_threshold_deg is not None and n_candidates > 1
+        _, idx = tree.query(ps, k=min(n_candidates, len(td)) if use_angle else 1)
+        idx = np.asarray(idx).reshape(n, -1)
+        n_fallback = 0
+        if use_angle:
+            cos = np.abs(np.einsum("nd,nkd->nk", tan_a, tan_dense[idx]))
+            ok = cos >= np.cos(np.radians(angle_threshold_deg))
+            has = ok.any(axis=1)
+            sel = idx[np.arange(n), np.where(has, ok.argmax(axis=1), 0)]
+            n_fallback = int((~has).sum())
+        else:
+            sel = idx[:, 0]
+ 
+        # refine: closest point on the two dense segments next to the start
+        # (chord error ~ h^2*curvature/8, negligible for n_dense ~ 1000), then
+        # ONE spline evaluation at the resulting parameter
+        nd = len(td)
+        left_seg = np.clip(sel - 1, 0, nd - 2)
+        best_d2 = np.full(n, np.inf)
+        t_best = td[sel].astype(float)
+        for seg in (left_seg, np.clip(sel, 0, nd - 2)):
+            a, ab = pd[seg], pd[seg + 1] - pd[seg]
+            u = np.clip(np.einsum("ij,ij->i", ps - a, ab)
+                        / np.maximum(np.einsum("ij,ij->i", ab, ab), 1e-24), 0.0, 1.0)
+            delta = a + u[:, None] * ab - ps
+            d2 = np.einsum("ij,ij->i", delta, delta)
+            better = d2 < best_d2
+            best_d2 = np.where(better, d2, best_d2)
+            t_best = np.where(better, td[seg] + u * (td[seg + 1] - td[seg]), t_best)
+        matched_points = np.asarray(spline(t_best))
+        distances = np.linalg.norm(matched_points - ps, axis=1)
+        distance = float(np.mean(distances))
+ 
+        if not return_details:
+            return distance
+ 
+        # split displacement along / across the reference tangent
+        tangential = np.abs(np.einsum("ij,ij->i", matched_points - ps, tan_a))
+        perpendicular = np.sqrt(np.maximum(distances ** 2 - tangential ** 2, 0.0))
+ 
+        return distance, {
+            "distance": distance,
+            "reference_is_a": short is channel_a,
+            "reference_parameters": ts, "reference_points": ps,
+            "reference_radii": rs, "reference_arc_length": ss,
+            "matched_parameters": t_best, "matched_points": matched_points,
+            "distances": distances,
+            "mean": distance,
+            "median": float(np.median(distances)),
+            "q90": float(np.percentile(distances, 90)),
+            "q95": float(np.percentile(distances, 95)),
+            "max": float(np.max(distances)),
+            "long_channel_length": float(max(la, lb)),
+            "short_channel_length": float(min(la, lb)),
+            "tangential_component": tangential,     # (these two names were swapped before)
+            "normal_component": perpendicular,
+            "n_angle_fallback": n_fallback,
+        }
+
+    @staticmethod
+    def frechetDistance(channel_a, channel_b, n_samples=300, return_details=False):
+        """Discrete Frechet distance between arc-length-sampled centerlines."""
+        from scipy.spatial.distance import cdist
+        
+        _, pa, ra, sa, _ = _arc(channel_a, n_samples)
+        _, pb, rb, sb, _ = _arc(channel_b, n_samples)
+        na, nb = len(pa), len(pb)
+        if na == 0 or nb == 0:
+            return (np.inf, {}) if return_details else np.inf
+
+        D = cdist(pa, pb)
+        if not return_details:
+            return _frechetTable(D)
+        ca = _frechetTable(D, full=True)
+        distance = float(ca[-1, -1])
+
+        i, j = na - 1, nb - 1
+        path = [(i, j)]
+        while i > 0 or j > 0:
+            if i == 0:
+                j -= 1
+            elif j == 0:
+                i -= 1
+            else:
+                _, i, j = min([(ca[i - 1, j], i - 1, j),
+                               (ca[i, j - 1], i, j - 1),
+                               (ca[i - 1, j - 1], i - 1, j - 1)], key=lambda x: x[0])
+            path.append((i, j))
+
+        return distance, {"distance": distance,
+                        "a_points": pa, "b_points": pb,
+                        "a_radii": ra, "b_radii": rb,
+                        "a_arc_length": sa, "b_arc_length": sb,
+                        "coupling_path": np.asarray(path[::-1], dtype=int),
+                        "n_a": na, "n_b": nb}
+
+####### POST CLUSTERING METRICS #######
+
+#### post-clustering #####
+    _PAIRWISE_ITEMS = None
+    _PAIRWISE_FN = None
+    _PAIRWISE_KWARGS = None
 
 
+    def _initPairwiseWorker(self,items, fn, kwargs):
+        global _PAIRWISE_ITEMS, _PAIRWISE_FN, _PAIRWISE_KWARGS
+
+        _PAIRWISE_ITEMS = items
+        _PAIRWISE_FN = fn
+        _PAIRWISE_KWARGS = kwargs
+
+    def _pairwiseDistanceChunk(self,pair_chunk):
+        ii, jj = pair_chunk
+
+        distances = np.empty(len(ii), dtype=float)
+
+        for k, (i, j) in enumerate(zip(ii, jj)):
+            distances[k] = _PAIRWISE_FN(
+                _PAIRWISE_ITEMS[i],
+                _PAIRWISE_ITEMS[j],
+                **_PAIRWISE_KWARGS
+            )
+
+        return ii, jj, distances
+    
+    def pairwiseDistanceMatrix(self, items, metric='chamfer', max_proc=None, mp_context=None, **kwargs):
+        """
+        Symmetric (n x n) distance matrix between ChannelRecords (or Channels).
+        `metric` is a function f(a, b, **kwargs) -> float, e.g.
+        ChannelMetrics.frechetDistance (default: symmetricChamferDistance);
+        kwargs (n_samples, ...) are forwarded to it. Only the upper triangle is
+        computed. n_jobs != 1 uses joblib threads.
+        """
+        import multiprocessing as mp
+        # from multiprocessing import Pool, cpu_count
+        metrics = {'chamfer': self.symmetricChamferDistance,
+                'frechet': self.frechetDistance,
+                'projection': self.splineProjectionDistance}
+        if callable(metric):
+            fn = metric
+        elif metric in metrics:
+            fn = metrics[metric]
+        else:
+            raise ValueError(f"unknown metric {metric!r}; use one of {list(metrics)} or a callable")
+
+        kwargs.pop("return_details", None)
+        items = list(items)
+        n = len(items)
+        D = np.zeros((n, n))
+        if n > 1:
+            ii, jj = np.triu_indices(n, 1)
+            n_pairs = len(ii)
+
+            iu = np.triu_indices(n, 1)
+            pairs = [(items[i], items[j]) for i, j in zip(*iu)]
+
+            if max_proc == 1:
+                D[iu] = [fn(a, b, **kwargs) for a, b in pairs]
+            else:
+                if mp_context is None:
+                    ctx = mp.get_context()
+                else:
+                    ctx = mp.get_context(mp_context)
+                if max_proc is None:
+                    max_proc = max(1, ctx.cpu_count()//2)
+                chunksize = max(1, n_pairs//(max_proc*4))
+
+                pair_chunks = ((ii[start:start + chunksize], jj[start:start + chunksize])
+                                                for start in range(0, n_pairs, chunksize))
+                with ctx.Pool(processes=max_proc, initializer=self._initPairwiseWorker, 
+                                            initargs=(items, fn, kwargs)) as pool:
+                    for ci, cj, distances in pool.imap_unordered(self._pairwiseDistanceChunk,
+                        pair_chunks,chunksize=1):
+                        D[ci, cj] = distances
+                
+        return D + D.T
+
+    def clusterDistanceMatrix(self, cluster, metric='chamfer', store=False, D=None, **kwargs):
+        metrics = {'chamfer': self.symmetricChamferDistance,
+                'frechet': self.frechetDistance,
+                'projection': self.splineProjectionDistance}
+        if callable(metric):
+            fn = metric
+        elif metric in metrics:
+            fn = metrics[metric]
+        else:
+            raise ValueError(f"unknown metric {metric!r}; use one of {list(metrics)} or a callable")
+
+        if D is None:
+            D = self.pairwiseDistanceMatrix(cluster.records, fn, **kwargs)
+        if store:
+            n = len(D)
+            nn = (D + np.diag(np.full(n, np.inf))).min(axis=1) if n > 1 else np.zeros(n)
+            cluster.internal_distance_matrix = D
+            cluster.mean_pairwise_distance = float(D[np.triu_indices(n, 1)].mean()) if n > 1 else 0.0
+            cluster.max_nearest_neighbor_distance = float(nn.max()) if n else 0.0
+            cluster.details["medoid_local"] = int(np.argmin(D.sum(axis=1))) if n else None
+            cluster.details["distance_metric"] = getattr(fn, "__name__", "custom")
+        return D
+
+    def clusteringDistanceMatrices(self, clustering, metric=None,
+                                   reuse_clustering_matrix=False, **kwargs):
+        """
+        clusterDistanceMatrix for every cluster in a ClusteringRecords.
+        Returns {cluster.label: matrix} and sets cluster.mediod to the GLOBAL
+        index into clustering.records when all its records are in there.
+
+        reuse_clustering_matrix=True slices the square clustering.distance_matrix
+        instead of recomputing -- only valid if it used the same metric/params.
+        """
+        clusters = clustering.clusters
+        clusters = clusters.values() if isinstance(clusters, dict) else clusters
+        gidx = {id(r): i for i, r in enumerate(clustering.records)}
+        full = np.asarray(clustering.distance_matrix) if reuse_clustering_matrix else None
+        out = {}
+        for cl in clusters:
+            ids = [gidx.get(id(r)) for r in cl.records]
+            known = None not in ids
+            D = full[np.ix_(ids, ids)] if full is not None and known else None
+            out[cl.label] = self.clusterDistanceMatrix(cl, metric, D=D, **kwargs)
+        return out
+
+class Cluster:
+    def __init__(self, label, records, details=None, parent=None, depth=0):
+        self.label = label
+        self.records = records
+        self.details = details if details is not None else {}   # was a shared mutable default
+        self.conformation_ids = [rec.conformation_id for rec in records]
+        self.approximated = None
+        self.soft_assigned = None
+
+        self.parent = parent
+        self.children = []
+        self.local_label = None
+
+        self.size = len(records)
+        self.persistence = None
+        self.mediod = None              # GLOBAL index into the fitted subsample
+        self.mean_pairwise_distance = None
+        self.density = None
+        self.max_nearest_neighbor_distance = None
+        self.internal_distance_matrix = None
+        self.mean_probability = None    # only if hdbscan
+        self.voxelized_graph = None
+        self.graph_occupancy = None
+        #ClusterCalculator.ClusteringRecords()
+        # set by ClusteringRecords.fit(); refer to the ORIGINAL subsample,
+        # so they stay valid after extendCluster()
+        self.rep_idx = None             # subsample indices of representatives
+        self.rep_threshold = None       # acceptance radius computed on the reps
+
+        self.depth = depth
+        self.distance_matrix = None #if subcluster
+        self.linkage_matrix = None #if subcluster
+        self.model = None #if subcluster
+
+    @property
+    def _threshold(self):
+        if self.rep_threshold is not None:
+            return self.rep_threshold
+        return max(self.mean_pairwise_distance, self.max_nearest_neighbor_distance)
+
+    def _resetStats(self):
+        self.persistence = None
+        self.mediod = None
+        self.mean_pairwise_distance = None
+        self.density = None
+        self.max_nearest_neighbor_distance = None
+        self.internal_distance_matrix = None
+        self.mean_probability = None
+        self.voxelized_graph = None
+        self.graph_occupancy = None
+    
+    def extendCluster(self,records):
+        records = list(records)
+        self.records = list(self.records) + records
+        self.conformation_ids.extend(rec.conformation_id for rec in records)
+        self.approximated = True
+        self.size = len(self.records)
+        self._resetStats()
+
+    def _calcInternalDistanceMatrix(self,distance_matrix,labels):
+        D = np.asarray(distance_matrix)
+        labels = np.asarray(labels)
+        idx = np.flatnonzero(labels == self.label)
+        if len(idx) == 0:
+            raise ValueError("Cluster {0} does not exist.".format(self.label))
+        Dc = D[np.ix_(idx, idx)]
+        self.internal_distance_matrix = Dc
+    
+    def _calcPersistance(self,num_conformations):
+        self.persistance = self.size/num_conformations
+
+    def _calcClusterStats(self,labels):
+        labels = np.asarray(labels)
+        idx = np.flatnonzero(labels == self.label)
+        n = len(idx)            # not self.size: size grows after extendCluster()
+        Dc = self.internal_distance_matrix
+        self.mediod = int(idx[np.argmin(Dc.sum(axis=1))])
+        if n > 1:
+            upper = Dc[np.triu_indices(n, k=1)]
+
+            mean_pairwise_distance = upper.mean()
+        else:
+            mean_pairwise_distance = 0.0
+        self.mean_pairwise_distance = mean_pairwise_distance
+        # For every point, find its closest OTHER point in the cluster.
+        # Then take the largest of those nearest-neighbor distances.
+        if n > 1:
+            Dc_no_diag = Dc.copy()
+            np.fill_diagonal(Dc_no_diag, np.inf)
+            nearest_neighbor_distances = Dc_no_diag.min(axis=1)
+            self.max_nearest_neighbor_distance = nearest_neighbor_distances.max()
+        else:
+            self.max_nearest_neighbor_distance = 0.0
+        # Here density is defined as inverse mean pairwise distance.
+        # Higher = more compact.
+        if n > 1 and mean_pairwise_distance > 0:
+            self.density = 1.0 / mean_pairwise_distance
+        else:
+            self.density = np.inf
+
+    def buildVoxelizedGraph(self, min_occupancy=0.0, return_coordinates=False):
+        if not np.any(self.records):
+            self.graph_occupancy = None
+            self.voxelized_graph = None
+            if return_coordinates:
+                return (np.zeros((0, 0, 0), dtype=np.float32),None,None)
+            
+        calculator = self.records[0].calculator
+        voxel_size = calculator.voxel_size
+        global_origin = np.asarray(calculator.global_origin, dtype=float)
+        for record in self.records:
+            if not record.voxelized:
+                record._prepareVoxels()
+
+        global_min = np.min(np.vstack([record.offset 
+                            for record in self.records]),
+                            axis=0)
+
+        global_max = np.max(np.vstack([ record.offset + record.dims
+                            for record in self.records
+                            ]),axis=0)
+
+        global_dims = global_max - global_min
+        occupancy_count = np.zeros(global_dims,dtype=np.uint16)
+        for record in self.records:
+            start = record.offset - global_min
+            end = start + record.dims
+            sub = occupancy_count[start[0]:end[0],
+                                start[1]:end[1],
+                                start[2]:end[2]]
+
+            sub += record.mask.astype(np.uint16)
+        occupancy = occupancy_count.astype(np.float32) / self.size
+        if min_occupancy > 0:
+            occupancy[occupancy < min_occupancy] = 0.0
+        occupancy_origin = (global_origin + global_min * voxel_size)
+        self.graph_occupancy = occupancy
+        self.voxelized_graph = {
+            "occupancy": occupancy,
+            "origin": occupancy_origin,
+            "voxel_size": voxel_size,
+            "dims": global_dims,
+            "global_offset": global_min,
+            "n_channels": self.size}
+
+        if return_coordinates:
+            return occupancy, occupancy_origin, voxel_size
+
+        return occupancy
+    
+    def writeVoxelOccupancyPQR(self,output_file, min_occupancy=0.0, occupancy_as_charge=True):
+        """
+        Write the cluster voxel occupancy as a PQR-like FIL file.
+
+        Each occupied voxel is written as one FIL pseudoatom. The occupancy
+        value is stored in the PQR charge field.
+
+        Parameters
+        ----------
+        output_file : str
+            Output PQR filename.
+
+        min_occupancy : float, optional
+            Only voxels with occupancy >= this value are written.
+            Default is 0.0.
+
+        occupancy_as_charge : bool, optional
+            Store occupancy in the PQR charge field. Default True.
+
+        Returns
+        -------
+        output_file : str
+        """
+        if self.graph_occupancy is None:
+            self.buildVoxelizedGraph(min_occupancy=min_occupancy)
+
+        occupancy = self.graph_occupancy
+        info = self.voxelized_graph
+        if occupancy is None:
+            return None
+        origin = np.asarray(info["origin"], dtype=float)
+        voxel_size = float(info["voxel_size"])
+        indices = np.argwhere(occupancy >= min_occupancy)
+        if len(indices) == 0:
+            with open(output_file, "w"):
+                pass
+            return output_file
+        values = occupancy[indices[:, 0],
+                            indices[:, 1],
+                            indices[:, 2]]
+        coordinates = (origin + (indices + 0.5) * voxel_size)
+
+        with open(output_file, "w") as out:
+            for atom_id, (xyz, occ) in enumerate(zip(coordinates, values),start=1):
+                x, y, z = xyz
+                charge = float(occ) if occupancy_as_charge else 0.0
+                # Use voxel radius as the PQR radius.
+                radius = voxel_size * 0.5
+                label = self.label if self.label is not None else -1
+                out.write(
+                    f"ATOM  {atom_id:5d}  H   FIL T{label:4d}    "
+                    f"{x:8.3f}{y:8.3f}{z:8.3f}"
+                    f"{charge:8.4f}{radius:7.3f}\n"
+                )
+                
+        return output_file
+
+class ClusteringRecords:
+    def __init__(self,model, records, clusters, labels, distance_matrix, linkage_matrix=None, levels=[0]):
+        self.model = model
+        self.records = records
+        self.linkage_matrix = linkage_matrix
+        self.clusters = clusters
+        self.labels = labels
+        self.distance_matrix = distance_matrix
+        self.num_clusters = len(clusters)
+        self.levels = levels
+        self.between_distances = None
+        self.approximated = False
+        self._by_label = {}
+        self._n_sub = len(self.labels)
+        self._fitted = False
+        self.sub_clusterings = None
+
+    def getClusterByLabel(self,label):
+        for cluster in self.clusters:
+            if cluster.label == label:
+                return cluster
+        LOGGER.warn('No Cluster With Label {0} found'.format(label))
+        return None
+
+    def fit(self, max_reps_per_cluster=500, random_state=123, keep_internal=True):
+        """Choose representatives and an acceptance threshold per cluster,
+        using only the (n_sub, n_sub) distance matrix.
+
+        Cluster-level stats (medoid etc.) are computed here if the Cluster
+        doesn't have them yet. Representatives are a random subset that
+        always includes the medoid.
+        """
+        D = np.asarray(self.distance_matrix, dtype=float)
+        if D.ndim != 2 or D.shape[0] != D.shape[1]:
+            raise ValueError("distance_matrix must be square (n_sub, n_sub)")
+        if D.shape[0] != len(self.labels):
+            raise ValueError("distance_matrix size must match len(labels)")
+
+        rng = np.random.default_rng(random_state)
+        self._n_sub = D.shape[0]
+        self._by_label = {}
+
+        for cluster in self.clusters:
+            member_idx = np.flatnonzero(self.labels == cluster.label)
+            if len(member_idx) == 0:
+                LOGGER.warn('Cluster {0} has no members in labels'.format(cluster.label))
+                continue
+
+            if cluster.internal_distance_matrix is None or cluster.mediod is None:
+                cluster._calcInternalDistanceMatrix(D, self.labels)
+                cluster._calcClusterStats(self.labels)
+
+            n = len(member_idx)
+            # cluster.mediod is a global index -> position within this cluster
+            medoid_local = int(np.flatnonzero(member_idx == cluster.mediod)[0])
+
+            if max_reps_per_cluster is not None and n > max_reps_per_cluster:
+                others = np.delete(np.arange(n), medoid_local)
+                pick = rng.choice(others, size=max_reps_per_cluster - 1, replace=False)
+                rep_local = np.concatenate([[medoid_local], pick])
+            else:
+                rep_local = np.arange(n)
+            rep_idx = member_idx[rep_local]
+
+            if len(rep_idx) > 1:
+                D_rep = D[np.ix_(rep_idx, rep_idx)]          # fancy indexing copies
+                mean_pw = float(D_rep[np.triu_indices(len(rep_idx), k=1)].mean())
+                np.fill_diagonal(D_rep, np.inf)
+                max_nn = float(D_rep.min(axis=1).max())
+            else:
+                mean_pw, max_nn = 0.0, 0.0
+
+            cluster.rep_idx = rep_idx
+            cluster.rep_threshold = max(mean_pw, max_nn)
+            cluster.approximated = len(rep_idx) < n
+            if not keep_internal:
+                cluster.internal_distance_matrix = None
+
+            self._by_label[int(cluster.label)] = cluster
+
+        self.num_clusters = len(self._by_label)
+        self.approximated = True
+        self._fitted = True
+        return self
+
+    def _checkFitted(self):
+        if not self._fitted or not self._by_label:
+            raise RuntimeError("call fit() first")
+
+    @staticmethod
+    def _batches(new_to_sub, n_new, batch_size):
+        for start in range(0, n_new, batch_size):
+            end = min(start + batch_size, n_new)
+            block = new_to_sub(start, end) if callable(new_to_sub) else new_to_sub[start:end]
+            yield start, end, np.asarray(block, dtype=float)
+
+    def _nNew(self, new_to_sub, n_new):
+        if callable(new_to_sub):
+            if n_new is None:
+                raise ValueError("n_new is required when new_to_sub is a callable")
+            return n_new
+        return len(new_to_sub)
+
+    def _distToClusters(self, block, labels_list):
+        """(b, n_sub) block -> (b, k): min distance to each cluster's reps."""
+        if block.shape[1] != self._n_sub:
+            raise ValueError(f"expected {self._n_sub} columns (one per subsample "
+                                f"point), got {block.shape[1]}")
+        return np.stack([block[:, self._by_label[l].rep_idx].min(axis=1)
+                            for l in labels_list], axis=1)
+
+    def assign(self, new_to_sub, n_new=None, batch_size=2000, strict=True,
+                slack=1.0, atol=1e-9):
+        """Hard-assign new points; -1 = unassigned. See earlier docstring."""
+        self._checkFitted()
+        n = self._nNew(new_to_sub, n_new)
+        labels_list = list(self._by_label)
+        lbl_arr = np.array(labels_list)
+        thr = np.array([self._by_label[l]._threshold for l in labels_list]) * slack
+        thr = np.where(thr == 0.0, atol, thr)
+
+        out = np.full(n, -1, dtype=int)
+        for start, end, block in self._batches(new_to_sub, n, batch_size):
+            d = self._distToClusters(block, labels_list)
+            best_j = d.argmin(axis=1)
+            best_d = d[np.arange(len(d)), best_j]
+            accept = np.ones(len(d), bool) if not strict else best_d <= thr[best_j]
+            out[start:end] = np.where(accept, lbl_arr[best_j], -1)
+        return out
+
+    def softAssign(self, new_to_sub, n_new=None, max_distance=None,
+                    bandwidth=None, top_k=None, batch_size=2000):
+        """Soft-assign borderline points. Returns (labels_list, probs)."""
+        self._checkFitted()
+        n = self._nNew(new_to_sub, n_new)
+        labels_list = list(self._by_label)
+        k = len(labels_list)
+
+        thr = np.array([self._by_label[l]._threshold for l in labels_list])
+        thr = thr[thr > 0]
+        if max_distance is None:
+            max_distance = float(2.0 * thr.max()) if thr.size else 1.0
+        if bandwidth is None:
+            bandwidth = max(float(np.median(thr)) if thr.size else 1.0, 1e-6)
+
+        probs = np.zeros((n, k))
+        for start, end, block in self._batches(new_to_sub, n, batch_size):
+            d = self._distToClusters(block, labels_list)
+            w = np.where(d <= max_distance, np.exp(-d / bandwidth), 0.0)
+
+            if top_k is not None and top_k < k:
+                keep = np.argpartition(-w, top_k - 1, axis=1)[:, :top_k]
+                mask = np.zeros_like(w, dtype=bool)
+                np.put_along_axis(mask, keep, True, axis=1)
+                w = np.where(mask, w, 0.0)
+
+            s = w.sum(axis=1, keepdims=True)
+            probs[start:end] = np.divide(w, s, out=np.zeros_like(w), where=s > 0)
+        return labels_list, probs
+
+    def extend(self, new_records, new_to_sub, batch_size=2000, strict=True, slack=1.0):
+        """Hard-assign new ChannelRecords and add them to their Clusters via
+        Cluster.extendCluster(). Returns the labels (-1 = left unassigned)."""
+        new_records = list(new_records)
+        labels = self.assign(new_to_sub, n_new=len(new_records),
+                                batch_size=batch_size, strict=strict, slack=slack)
+        for lbl in np.unique(labels):
+            if lbl == -1:
+                continue
+            members = [new_records[i] for i in np.flatnonzero(labels == lbl)]
+            self._by_label[int(lbl)].extendCluster(members)
+        return labels
+
+    def updateRecordClusterIds(self):
+        """
+        Rebuild every record's `cluster_ids` from `self.clusters`.
+
+        Each record gets the labels of all clusters that contain it, ordered
+        coarse -> fine (by cluster depth). Records in no cluster get []. Because it
+        is rebuilt from the clusters, it is safe to call after any change to
+        `self.clusters` (new hierarchy, noise removal, ...).
+        """
+        ids = {id(r): [] for r in self.records}
+        ordered = sorted(self.clusters, key=lambda c: (getattr(c, "depth", 0), c.label))
+        for cl in ordered:
+            for r in cl.records:
+                ids[id(r)].append(cl.label)
+        for r in self.records:
+            r.cluster_ids = ids[id(r)]
 
 
+    def removeClusters(self, noise_labels, update_labels=True):
+        """
+        Declare clusters noise: drop them from the clustering and update everything
+        that refers to them.
+
+        Parameters
+        ----------
+        noise_labels : iterable of int
+            Labels (Cluster.label) of the clusters to remove.
+        update_labels : bool, default=True
+            Also write -1 into `self.labels` for the removed clusters' points.
+            This assumes Cluster.label values are the values used in self.labels
+            (true for flat clusterings). Pass False for hierarchy clusters, whose
+            labels live in `self.hierarchy_labels` instead.
+
+        What is updated
+        ---------------
+        * self.clusters            removed clusters dropped
+        * parent / children        surviving children of a removed cluster are
+                                re-attached to its nearest surviving ancestor
+                                (or become roots); local_label renumbered
+        * hierarchy_roots / hierarchy_levels / hierarchy_labels / hierarchy_noise
+                                updated if a hierarchy exists
+        * self.labels              -1 for removed points (new array, not in place)
+        * record.cluster_ids       rebuilt via updateRecordClusterIds()
+
+        Returns
+        -------
+        removed : list of Cluster
+        """
+        if np.isscalar(noise_labels):
+            noise_labels = [noise_labels]
+        noise = {int(x) for x in noise_labels}
+        clusters = list(getattr(self, "clusters", None) or [])
+        removed = [c for c in clusters if c.label in noise]
+        if not removed:
+            return []
+        removed_ids = {id(c) for c in removed}
+        survivors = [c for c in clusters if id(c) not in removed_ids]
+
+        # Re-attach survivors to their nearest surviving ancestor.
+        touched = {}
+        for cl in survivors:
+            p = cl.parent
+            if p is None or id(p) not in removed_ids:
+                continue
+            while p is not None and id(p) in removed_ids:
+                p = p.parent
+            cl.parent = p
+            if p is not None:
+                p.children.append(cl)
+                touched[id(p)] = p
+        # Parents that lost a child.
+        for cl in survivors:
+            if any(id(ch) in removed_ids for ch in cl.children):
+                cl.children = [ch for ch in cl.children if id(ch) not in removed_ids]
+                touched[id(cl)] = cl
+        for p in touched.values():
+            p.children = sorted(p.children, key=lambda c: c.label)
+            for k, ch in enumerate(p.children):
+                ch.local_label = k
+        for cl in removed:                       # detach the dropped objects
+            cl.children = []
+            cl.parent = None
+
+        self.clusters = survivors
+
+        # Hierarchy bookkeeping, if present.
+        if getattr(self, "hierarchy_roots", None) is not None:
+            self.hierarchy_roots = [c for c in survivors if c.parent is None]
+        if getattr(self, "hierarchy_levels", None) is not None:
+            self.hierarchy_levels = [[c for c in lvl if id(c) not in removed_ids]
+                                    for lvl in self.hierarchy_levels]
+        hl = getattr(self, "hierarchy_labels", None)
+        if hl is not None and getattr(hl, "size", 0):
+            mask = np.isin(hl, list(noise))
+            hl = hl.copy()
+            hl[mask] = -1
+            self.hierarchy_labels = hl
+            hn = getattr(self, "hierarchy_noise", None)
+            if hn is not None and hn.shape == mask.shape:
+                self.hierarchy_noise = hn | mask
+
+        if update_labels and getattr(self, "labels", None) is not None:
+            labels = np.asarray(self.labels)
+            self.labels = np.where(np.isin(labels, list(noise)), -1, labels)
+
+        self.updateRecordClusterIds()
+        return removed
 
 
+    def getAggLinkageMatrix(self):
+        model = self.model
+        if not hasattr(model, "children_") \
+                or not hasattr(model, "distances_") \
+                or not hasattr(model, "n_leaves_"):
+            raise ValueError("Model does not have the required attributes for linkage matrix calculation.")
+        children = model.children_
+        distances = model.distances_
+        n = model.n_leaves_
+        counts = np.zeros(children.shape[0], dtype=np.int64)
+        for i, (left, right) in enumerate(children):
+            count = 0
+            if left < n:
+                count += 1
+            else:
+                count += counts[left - n]
+            if right < n:
+                count += 1
+            else:
+                count += counts[right - n]
+            counts[i] = count
+        self.linkage_matrix = np.column_stack([children,distances,counts])
+        return self.linkage_matrix
+
+    def agglomerativeClusterQuality(self,labels=None,linkage_matrix=None,min_cluster_size=3,
+                min_persistence_ratio=2.0, singleton_noise=True, condense_size=None,
+                external="cluster", min_ratio_floor=1.0):
+        """
+        Parameters
+        ----------
+        labels : array (n_samples,)   flat labels, negative = noise.
+        linkage_matrix : (n_samples - 1, 4) scipy/sklearn linkage matrix.
+        min_cluster_size, min_persistence_ratio : see stability_noise_decision.
+        singleton_noise : singletons are always noise.
+        condense_size : min points for a sub-branch to count as a real split
+            (default min_cluster_size).
+        external : "cluster" -> birth = first ancestor merge joining another
+            non-noise cluster (noise-only merges ignored); "parent" -> birth =
+            merge with the immediate parent node.
+        min_ratio_floor : extra guard, noise if ext/int is below this
+            (1.0 = disabled; try 1.2).
+
+        Returns DataFrame: cluster, size, node_size, coherence,
+            internal_merge_distance, external_merge_distance, persistence_ratio,
+            persistence_gap, stability, mean_persistence, stability_lambda,
+            stability_ratio, recommended_noise
+        """
+        import pandas as pd
+        _NONE, _MIXED = -1, -2
+
+        if linkage_matrix is None:
+            if (linkage_matrix := self.linkage_matrix) is None:
+                linkage_matrix = self.getAggLinkageMatrix()
+        labels = np.asarray(self.labels)
+        n = len(labels)
+        Z = np.asarray(linkage_matrix, dtype=float)
+        if Z.shape != (n - 1, 4):
+            raise ValueError("linkage_matrix must have shape (n_samples - 1, 4).")
+        if external not in ("cluster", "parent"):
+            raise ValueError("external must be 'cluster' or 'parent'.")
+        cond = int(condense_size or min_cluster_size)
+
+        D = ClusterCalculator.DendrogramStability(Z, leaf_weight=labels >= 0, condense_size=cond)
+        parent, ncl, raw, floor = D.parent, D.ncl, D.raw, D.floor
+        left, right = D.left, D.right
+
+        total = 2 * n - 1
+        state = np.full(total, _NONE, dtype=int)   # pure label / NONE / MIXED
+        for i in range(n):
+            if labels[i] >= 0:
+                state[i] = labels[i]
+        for i in range(n - 1):
+            v, a, b = n + i, left[i], right[i]
+            sa, sb = state[a], state[b]
+            if sa == _NONE:
+                state[v] = sb
+            elif sb == _NONE:
+                state[v] = sa
+            elif sa == sb and sa >= 0:
+                state[v] = sa
+            else:
+                state[v] = _MIXED
+
+        # Highest pure node per cluster (the one holding most of its members).
+        best = {}
+        for v in range(total):
+            c = state[v]
+            if c < 0:
+                continue
+            p = parent[v]
+            if p != -1 and state[p] == c:
+                continue
+            if c not in best or ncl[v] > ncl[best[c]]:
+                best[c] = v
+
+        threshold = min_cluster_size * np.log(min_persistence_ratio)
+        rows = []
+        for c in np.unique(labels[labels >= 0]):
+            size = int((labels == c).sum())
+            v = best.get(c)
+            node_size = int(Z[v - n, 3]) if v >= n else 1
+            coherence = ncl[v] / size  # <1 => cluster is split across the tree
+
+            internal = D.height(v)
+            ext = np.nan
+            p = parent[v]
+            while p != -1:
+                if external == "parent" or state[p] == _MIXED:
+                    ext = raw[p - n]
+                    break
+                p = parent[p]
+
+            if np.isfinite(ext):
+                if internal > 0:
+                    ratio, gap = ext / internal, ext - internal
+                else:
+                    ratio, gap = np.inf, ext
+                if size == 1:
+                    s_log = s_lam = np.inf
+                else:
+                    s_log, s_lam = D.stability(v, ext)
+            else:  # only cluster / nothing to separate from
+                ratio = gap = s_log = s_lam = np.nan
+
+            noise = ClusterCalculator.stabilityNoiseDecision(size, s_log, ratio, min_cluster_size,
+                                            min_persistence_ratio,
+                                            singleton_noise, min_ratio_floor)
+            rows.append({
+                "cluster": c,
+                "size": size,
+                "node_size": node_size,
+                "coherence": coherence,
+                "internal_merge_distance": internal,
+                "external_merge_distance": ext,
+                "persistence_ratio": ratio,
+                "persistence_gap": gap,
+                "stability": s_log,
+                "mean_persistence": s_log / size if np.isfinite(s_log) else s_log,
+                "stability_lambda": s_lam,
+                "stability_ratio": s_log / threshold if threshold > 0 else np.nan,
+                "recommended_noise": noise,
+            })
+
+        return pd.DataFrame(rows).sort_values("cluster").reset_index(drop=True)
+
+
+    def assignAggClusteringNoise(self, linkage_matrix=None, min_cluster_size=3,
+                min_persistence_ratio=2.0, singleton_noise=True, condense_size=None,
+                external="cluster", min_ratio_floor=1.0):
+        """
+        Assign noise points based on agglomerative clustering results.
+
+        Parameters
+        ----------
+        linkage_matrix : ndarray, optional
+            The linkage matrix from agglomerative clustering. If None, it will be computed.
+        min_cluster_size : int, optional
+            Minimum size of clusters to be considered non-noise.
+        min_persistence_ratio : float, optional
+            Minimum persistence ratio for small clusters to be retained.
+        singleton_noise : bool, optional
+            Whether singletons should be considered noise.
+
+        Returns
+        -------
+        labels : ndarray
+            Array of cluster labels with noise points marked as -1.
+        """
+        if linkage_matrix is None:
+            linkage_matrix = self.getAggLinkageMatrix()
+
+        quality_df = self.agglomerativeClusterQuality(linkage_matrix,
+                                                      min_cluster_size=min_cluster_size,
+                                                      min_persistence_ratio=min_persistence_ratio,
+                                                      singleton_noise=singleton_noise,
+                                                      condense_size=condense_size,
+                                                    external=external,
+                                                     min_ratio_floor=min_ratio_floor)
+        noise_clusters = quality_df.loc[quality_df["recommended_noise"], "cluster"].values
+        labels = self.labels
+        labels[np.isin(labels, noise_clusters)] = -1
+        if len(noise_clusters):
+            self.removeClusters(noise_clusters)  
+
+        return labels
+
+    def buildAgglomerativeHierarchy(self, linkage_matrix=None, cut_heights=None, n_levels=4,
+                                    min_cluster_size=3, singleton_noise=True,
+                                    min_persistence_ratio=2.0, min_persistence_gap=None,
+                                    noise_mode="stability", condense_size=None,
+                                    min_ratio_floor=1.0,
+                                    identify_stable_branches=False,
+                                    stable_min_size=None, stable_min_ratio=2.0,
+                                    stable_min_gap=None, update_record_ids=False):
+        """
+        Build a hierarchy of FLAT CUTS through an agglomerative dendrogram.
+
+        A cluster at level k is attached to the non-noise cluster at level k-1
+        containing its members. Noise is evaluated independently at every cut, so
+        a group may be noise at a fine cut but belong to a valid cluster at a
+        coarser cut.
+
+        Parameters
+        ----------
+        linkage_matrix : ndarray (n-1, 4), optional
+        cut_heights : sequence of float, optional
+            Sorted HIGH -> LOW (coarse -> fine). If None, `n_levels` heights are
+            taken from merge-distance quantiles.
+        n_levels : int, default=4
+        min_cluster_size : int, default=3
+        singleton_noise : bool, default=True
+        min_persistence_ratio : float
+            noise_mode="stability": a cluster is kept if
+                stability >= min_cluster_size * log(min_persistence_ratio)
+            i.e. size-weighted: a 3-point cluster needs ext/int >= 2, a 30-point
+            one only ~1.07. Must not be None in this mode.
+            Legacy modes: rescue ratio for small clusters (None = not used).
+        min_persistence_gap : float or None
+            Absolute guard: external - internal >= gap, else noise (stability
+            mode: applied to every cluster that has an external merge).
+        noise_mode : {"stability", "size", "persistence", "size_and_persistence"}
+            "stability" (default): HDBSCAN-style size-weighted persistence.
+            The other three are the previous ratio/gap behaviours.
+        condense_size : int or None
+            Minimum points for a sub-branch to count as a real split when
+            computing stability (default min_cluster_size).
+        min_ratio_floor : float, default=1.0
+            Stability mode: also noise if ext/int < this (try 1.2 to reject weakly
+            separated fragments of large clusters).
+        identify_stable_branches : bool
+            Independently find dendrogram branches that persist over a large local
+            height interval -> self.agglomerative_stable_branches. In stability
+            mode a branch qualifies if size >= stable_min_size and
+                stability >= stable_min_size * log(stable_min_ratio)
+            (and gap >= stable_min_gap if given); otherwise the old ratio test.
+        stable_min_size : int or None  (default min_cluster_size)
+        stable_min_ratio : float, default=2.0
+        stable_min_gap : float or None
+        update_record_ids : bool
+            Replace record.cluster_ids with the non-noise cluster path.
+
+        Returns
+        -------
+        clusters : list of Cluster (non-noise, coarse -> fine)
+
+        Each Cluster additionally carries in `.details`: stability,
+        mean_persistence, stability_lambda (and the existing ratio/gap fields);
+        `.stability` mirrors details["stability"]. `.persistence` is still the
+        ratio, for backward compatibility.
+
+        Results are stored as self.clusters-like attributes: hierarchy_roots,
+        hierarchy_levels, hierarchy_labels, hierarchy_noise, hierarchy_cut_heights,
+        agglomerative_stable_branches, levels.
+        """
+        from scipy.cluster.hierarchy import fcluster
+
+        modes = {"stability", "size", "persistence", "size_and_persistence"}
+        if noise_mode not in modes:
+            raise ValueError(f"noise_mode must be one of {sorted(modes)}.")
+        if noise_mode == "stability" and min_persistence_ratio is None:
+            raise ValueError("min_persistence_ratio is required for noise_mode='stability'.")
+
+        if linkage_matrix is None:
+            if (linkage_matrix := self.linkage_matrix) is None:
+                linkage_matrix = self.getAggLinkageMatrix()
+
+        Z = np.asarray(linkage_matrix, dtype=float)
+        n = len(self.records)
+
+        if n == 0:
+            self.clusters = []
+            self.hierarchy_roots = []
+            self.hierarchy_levels = []
+            self.hierarchy_labels = np.empty((0, 0), dtype=int)
+            self.hierarchy_noise = np.empty((0, 0), dtype=bool)
+            self.hierarchy_cut_heights = np.array([])
+            self.agglomerative_stable_branches = []
+            return []
+
+        if n == 1:
+            if Z.size != 0:
+                raise ValueError("linkage_matrix must be empty for one sample.")
+        elif Z.shape != (n - 1, 4):
+            raise ValueError(f"linkage_matrix must have shape ({n - 1}, 4), got {Z.shape}")
+
+        cond = int(condense_size or min_cluster_size)
+        D = ClusterCalculator.DendrogramStability(Z, condense_size=cond) if n > 1 else None
+        stab_threshold = min_cluster_size * np.log(min_persistence_ratio) \
+            if min_persistence_ratio else None
+
+        # ---- dendrogram helpers (heights are the monotone-fixed ones) ----------
+        def nodeDistance(node):
+            return 0.0 if node < n else float(D.raw[node - n])
+
+        def nodeSize(node):
+            return 1 if node < n else int(Z[node - n, 3])
+
+        def parentOf(node):
+            p = D.parent[node] if D is not None else -1
+            return None if p == -1 else int(p)
+
+        def leavesOf(node):
+            out, stack = [], [node]
+            while stack:
+                u = stack.pop()
+                if u < n:
+                    out.append(u)
+                else:
+                    stack.append(int(D.left[u - n]))
+                    stack.append(int(D.right[u - n]))
+            return np.sort(np.asarray(out, dtype=int))
+
+        def branchStats(node):
+            """A branch exists for internal <= h < external."""
+            internal = nodeDistance(node)
+            p = parentOf(node)
+            external = np.nan if p is None else nodeDistance(p)
+            if np.isfinite(external):
+                gap = external - internal
+                if internal > 0:
+                    ratio = external / internal
+                elif external > 0:
+                    ratio = np.inf
+                else:
+                    ratio = np.nan
+            else:
+                gap = ratio = np.nan
+            size = nodeSize(node)
+            if np.isfinite(external) and size > 1:
+                s_log, s_lam = D.stability(node, external)
+            elif np.isfinite(external):
+                s_log = s_lam = np.inf          # singleton
+            else:
+                s_log = s_lam = np.nan          # root: nothing to separate from
+            return {"node": int(node),
+                    "size": int(size),
+                    "internal_distance": float(internal),
+                    "external_distance": float(external),
+                    "persistence_gap": float(gap),
+                    "persistence_ratio": float(ratio),
+                    "stability": float(s_log),
+                    "mean_persistence": float(s_log / size) if np.isfinite(s_log) else float(s_log),
+                    "stability_lambda": float(s_lam)}
+
+        # ---- cut heights --------------------------------------------------------
+        if n == 1:
+            heights = np.array([0.0])
+        elif cut_heights is not None:
+            heights = np.asarray(cut_heights, dtype=float)
+            if heights.ndim != 1:
+                raise ValueError("cut_heights must be one-dimensional.")
+            if len(heights) == 0:
+                raise ValueError("cut_heights cannot be empty.")
+            if not np.all(np.isfinite(heights)):
+                raise ValueError("cut_heights contains non-finite values.")
+            if np.any(heights < 0):
+                raise ValueError("cut_heights must be >= 0.")
+            heights = np.unique(heights)[::-1]                     # coarse -> fine
+        else:
+            if n_levels < 1:
+                raise ValueError("n_levels must be >= 1.")
+            merge_distances = np.unique(Z[:, 2])
+            if len(merge_distances) <= n_levels:
+                heights = merge_distances[::-1]
+            else:
+                q = np.linspace(0.85, 0.15, n_levels)
+                heights = np.unique(np.quantile(merge_distances, q))[::-1]
+
+        # ---- noise decision for one flat cluster at one cut ---------------------
+        def is_noise(size, stats):
+            if singleton_noise and size == 1:
+                return True
+
+            if noise_mode == "stability":
+                noise = ClusterCalculator.stabilityNoiseDecision(
+                    size, stats["stability"], stats["persistence_ratio"],
+                    min_cluster_size, min_persistence_ratio,
+                    singleton_noise, min_ratio_floor)
+                if (not noise and min_persistence_gap is not None
+                        and np.isfinite(stats["persistence_gap"])
+                        and stats["persistence_gap"] < min_persistence_gap):
+                    noise = True
+                return noise
+
+            # ---- legacy modes (unchanged) ----
+            ratio_ok = (min_persistence_ratio is not None
+                        and np.isfinite(stats["persistence_ratio"])
+                        and stats["persistence_ratio"] >= min_persistence_ratio)
+            gap_ok = (min_persistence_gap is not None
+                    and np.isfinite(stats["persistence_gap"])
+                    and stats["persistence_gap"] >= min_persistence_gap)
+            if min_persistence_ratio is None and min_persistence_gap is None:
+                persistent = True
+            else:
+                tests = []
+                if min_persistence_ratio is not None:
+                    tests.append(ratio_ok)
+                if min_persistence_gap is not None:
+                    tests.append(gap_ok)
+                persistent = all(tests)
+            small = size < min_cluster_size
+            if noise_mode == "size":
+                return small
+            if noise_mode == "persistence":
+                return not persistent
+            return small and not persistent      # size_and_persistence
+
+        # ---- build the flat cuts -------------------------------------------------
+        all_clusters = []
+        hierarchy_levels = []
+        hierarchy_roots = []
+        hierarchy_labels = np.full((len(heights), n), -1, dtype=int)
+        hierarchy_noise = np.zeros((len(heights), n), dtype=bool)
+
+        global_counter = 0
+        previous_by_label = {}
+
+        for depth, h in enumerate(heights):
+            flat = np.ones(1, dtype=int) if n == 1 else fcluster(Z, t=float(h), criterion="distance")
+
+            # group indices by flat label in one pass
+            order = np.argsort(flat, kind="stable")
+            uniq, starts = np.unique(flat[order], return_index=True)
+            groups = np.split(order, starts[1:])
+
+            current_level = []
+            current_by_label = {}
+            for local_label, idx in zip(uniq, groups):
+                # Dendrogram node of this flat cluster: climb from any member while
+                # the parent merge still happens at or below the cut.
+                node = int(idx[0])
+                while True:
+                    p = parentOf(node)
+                    if p is None or nodeDistance(p) > h:
+                        break
+                    node = p
+                if nodeSize(node) != len(idx):
+                    raise RuntimeError("Could not map flat cluster back to dendrogram node. "
+                                    "This should not occur for a standard linkage matrix.")
+
+                stats = branchStats(node)
+                if is_noise(len(idx), stats):
+                    hierarchy_noise[depth, idx] = True
+                    continue
+
+                # Parent = cluster of the PREVIOUS (coarser) cut holding these points.
+                parent = None
+                if depth > 0:
+                    prev_label = hierarchy_labels[depth - 1, idx[0]]
+                    if prev_label >= 0:
+                        parent = previous_by_label.get(int(prev_label))
+
+                cl = Cluster(label=global_counter,
+                            records=[self.records[i] for i in idx],
+                            parent=parent,
+                            depth=depth)
+                global_counter += 1
+                cl.local_label = len(current_level)
+                cl.details["cut_height"] = float(h)
+                cl.details["cut_level"] = depth
+                cl.details["flat_cut_label"] = int(local_label)
+                cl.details["dendrogram_node"] = int(node)
+                cl.details["point_indices"] = idx
+                cl.details.update(stats)
+                cl.persistence = stats["persistence_ratio"]
+                cl.stability = stats["stability"]
+
+                if parent is None:
+                    hierarchy_roots.append(cl)
+                else:
+                    cl.local_label = len(parent.children)
+                    parent.children.append(cl)
+
+                current_level.append(cl)
+                current_by_label[cl.label] = cl
+                all_clusters.append(cl)
+                hierarchy_labels[depth, idx] = cl.label
+
+            hierarchy_levels.append(current_level)
+            previous_by_label = current_by_label
+
+        # ---- optional: strongly supported LOCAL branches (independent of cuts) --
+        stable_branches = []
+        if identify_stable_branches and n > 1:
+            if stable_min_size is None:
+                stable_min_size = min_cluster_size
+            stable_threshold = stable_min_size * np.log(stable_min_ratio)
+            for node in range(n, 2 * n - 1):
+                stats = branchStats(node)
+                if stats["size"] < stable_min_size:
+                    continue
+                gap_ok = (stable_min_gap is None
+                        or (np.isfinite(stats["persistence_gap"])
+                            and stats["persistence_gap"] >= stable_min_gap))
+                if noise_mode == "stability":
+                    strong = (np.isfinite(stats["stability"])
+                            and stats["stability"] >= stable_threshold)
+                else:
+                    strong = (np.isfinite(stats["persistence_ratio"])
+                            and stats["persistence_ratio"] >= stable_min_ratio)
+                if not (strong and gap_ok):
+                    continue
+                idx = leavesOf(node)
+                stable_branches.append({**stats,
+                                        "point_indices": idx,
+                                        "records": [self.records[i] for i in idx],
+                                        "height_min": stats["internal_distance"],
+                                        "height_max": stats["external_distance"]})
+
+            if noise_mode == "stability":
+                key = lambda x: (x["stability"], x["persistence_gap"], x["size"])
+            else:
+                key = lambda x: (x["persistence_ratio"], x["persistence_gap"], x["size"])
+            stable_branches.sort(key=key, reverse=True)
+
+        if update_record_ids:
+            for i, record in enumerate(self.records):
+                col = hierarchy_labels[:, i]
+                record.cluster_ids = [int(c) for c in col[col >= 0]]
+
+        self.hierarchy_roots = hierarchy_roots
+        self.hierarchy_levels = hierarchy_levels
+        self.hierarchy_labels = hierarchy_labels
+        self.hierarchy_noise = hierarchy_noise
+        self.hierarchy_cut_heights = heights
+        self.agglomerative_stable_branches = stable_branches
+        self.levels = list(heights)
+
+        return all_clusters
+        
+    def subcluster(self,cluster,distance_matrix,linkage_method="average",n_clusters=None,
+                        distance_threshold=None,update_record_ids=True,):
+        """
+        Subcluster an existing Cluster using a new distance matrix.
+        Parameters
+        ----------
+        cluster : Cluster
+            Existing cluster to subdivide.
+        distance_matrix : ndarray, shape (cluster.size, cluster.size)
+            Pairwise distance matrix for the records in `cluster.records`.
+            The ordering MUST correspond to cluster.records.
+        linkage_method : str, default="average"
+            Linkage method passed to scipy.cluster.hierarchy.linkage.
+        n_clusters : int, optional
+            Number of subclusters to create. Mutually exclusive with
+            distance_threshold.
+        distance_threshold : float, optional
+            Dendrogram distance at which to cut the hierarchy.
+            Mutually exclusive with n_clusters.
+
+        update_record_ids : bool, default=True
+            If True, append the local subcluster label to each
+            ChannelRecord.cluster_ids.
+        Returns
+        -------
+        children : list of Cluster
+            Newly created child clusters.
+        linkage_matrix : ndarray
+            Linkage matrix describing the subclustering.
+        labels : ndarray
+            Local labels corresponding to cluster.records.
+        Notes
+        -----
+        The parent Cluster is retained. The new clusters are attached
+        through:
+            cluster.children
+        and
+            cluster.subclusters
+        The linkage matrix and distance matrix are also stored on the
+        parent Cluster.
+        """
+
+        import numpy as np
+        from scipy.spatial.distance import squareform
+        from scipy.cluster.hierarchy import linkage, fcluster
+
+        if not isinstance(cluster, Cluster):
+            raise TypeError("cluster must be a Cluster instance.")
+
+        if n_clusters is not None and distance_threshold is not None:
+            raise ValueError("Specify either n_clusters or distance_threshold, "
+                                "not both.")
+
+        if n_clusters is None and distance_threshold is None:
+            raise ValueError("Specify either n_clusters or distance_threshold.")
+
+        records = cluster.records
+        n = len(records)
+        if n < 2:
+            raise ValueError("A cluster must contain at least two records "
+                                "to be subclustered.")
+        distance_matrix = np.asarray(distance_matrix,dtype=float)
+        if distance_matrix.shape != (n, n):
+            raise ValueError("distance_matrix must have shape "
+                                f"({n}, {n}) for this cluster, "
+                                f"got {distance_matrix.shape}.")
+        
+        if not np.all(np.isfinite(distance_matrix)):
+            raise ValueError("distance_matrix contains non-finite values.")
+        if not np.allclose(distance_matrix,distance_matrix.T,atol=1e-8):
+            raise ValueError("distance_matrix must be symmetric.")
+        if np.any(np.diag(distance_matrix) != 0):
+            raise ValueError("distance_matrix must have a zero diagonal.")
+
+        condensed = squareform(distance_matrix,checks=False)
+
+        Z = linkage(condensed,method=linkage_method,)
+        if n_clusters is not None:
+            if n_clusters < 1 or n_clusters > n:
+                raise ValueError(f"n_clusters must be between 1 and {n}.")
+
+            labels = (fcluster(Z,t=n_clusters,criterion="maxclust")- 1)
+        else:
+            if distance_threshold < 0:
+                raise ValueError("distance_threshold must be >= 0.")
+            labels = (fcluster(Z,t=distance_threshold,criterion="distance")- 1)
+
+
+        cluster.children = []
+        cluster.subclusters = []
+        cluster.distance_matrix = distance_matrix
+        cluster.linkage_matrix = Z
+
+        cluster.details["subclustering_method"] = linkage_method
+        cluster.details["subclustering_n_clusters"] = (len(np.unique(labels)))
+        cluster.details["subclustering_distance_threshold"] = (distance_threshold)
+        children = []
+        for local_label in np.unique(labels):
+            member_indices = np.flatnonzero(labels == local_label)
+            child_records = [records[i] for i in member_indices]
+            child = Cluster(label=int(local_label),
+                            records=child_records,
+                            depth=cluster.depth + 1,
+                            parent=cluster,
+                            local_label=int(local_label))
+            child.details["parent_label"] = cluster.label
+            child.details["local_label"] = int(local_label)
+            child.details["member_indices"] = member_indices
+            child.internal_distance_matrix = (distance_matrix[np.ix_(member_indices,member_indices)])
+            child.details["linkage_matrix"] = Z
+            children.append(child)
+        cluster.children = children
+        cluster.subclusters = children
+
+        if update_record_ids:
+            for child in children:
+                for record in child.records:
+                    if record.cluster_ids is None:
+                        record.cluster_ids = []
+                    path = []
+                    node = cluster
+                    while node is not None:
+                        path.append(node.label)
+                        node = getattr(node,"parent",None)
+                    path.reverse()
+                    if (not record.cluster_ids or record.cluster_ids != path):
+                        record.cluster_ids = path.copy()
+                    record.cluster_ids.append(child.label)
+        return children, Z, labels
+    
+    
 #: Colour of each rank - the 0-based position of an object among those a viewer
 #: script draws. One table for every PyMOL, VMD and ChimeraX script this module
 #: writes, so that a channel is the same colour in all of them; it is
@@ -13384,6 +14851,10 @@ def caverColour(rank):
                                 for rank, rgb in enumerate(_PALETTE)))
 
 
+#: Source of the PyMOL viewer that :func:`_writeVisScript` leaves beside what
+#: :func:`writePyMolCaviTracerScript` writes. Held inline so that this module
+#: carries everything it writes, and raw so the rank patterns keep their
+#: backslashes.
 #: Source of the PyMOL viewer that :func:`_writeVisScript` leaves beside what
 #: :func:`writePyMolCaviTracerScript` writes. Held inline so that this module
 #: carries everything it writes, and raw so the rank patterns keep their
@@ -13832,6 +15303,347 @@ else:
     print("Success: Files loaded in perfect sequential order with custom radii!")
 '''
 
+_VIS_CHANNELS_FLAT_TRAJ_SCRIPT = r"""
+import re
+import glob
+import sys
+import colorsys
+import os
+import argparse
+
+
+parser = argparse.ArgumentParser(
+    description=("Load trajectory channel PQR files into PyMOL, color the channels "
+        "according to externally generated cluster labels, and save one PyMOL "
+        "session (.pse) for each supplied clustering."),
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter,)
+
+parser.add_argument("file_pattern",
+    help=("Glob pattern selecting the trajectory channel PQR files. "
+        "Quote the pattern so that it is expanded by this script rather than "
+        "by the shell, e.g. 'channels/frame*_channel*.pqr'."),)
+
+parser.add_argument("--protein-file",
+    dest="protein_file",
+    default=None,
+    help=("Optional protein structure to load together with the channels. "
+        "The protein is displayed as a cartoon and included in each saved "
+        "PyMOL session."),)
+
+parser.add_argument("--labels",
+    nargs="+",
+    default=None,
+    metavar="LABEL_FILE",
+    help=( "One or more text files containing cluster labels. Each file may "
+        "contain either one clustering (one label per channel) or multiple "
+        "clustering columns. Rows must correspond to channels in the ordering "
+        "used by this script: ascending frame number, then ascending channel "
+        "rank within each frame. Cluster label -1 is treated as noise. "
+        "If omitted, channels are loaded without clustering labels."),)
+
+parser.add_argument("--out-file",
+    dest="out_file",
+    default="traj_out.pse",
+    help=( "Output PyMOL session filename. For a single clustering this is the "
+        "requested filename. If multiple clusterings are supplied, the "
+        "clustering name is appended to the stem, e.g. "
+        "'traj_out_hdbscan.pse'. Existing files are not overwritten; a "
+        "numeric suffix is added automatically."),)
+
+args = parser.parse_args()
+
+file_pattern = args.file_pattern
+protein_file = args.protein_file
+label_files = args.labels
+out_file = args.out_file
+
+files = sorted(glob.glob(file_pattern))
+if not files:
+    parser.error("No trajectory PQR files matched pattern: %s" % file_pattern)
+
+if protein_file:
+    protein_name = os.path.splitext(os.path.basename(protein_file))[0]
+    cmd.load(protein_file, protein_name)
+    cmd.hide("everything", protein_name)
+    cmd.show("cartoon", protein_name)
+    cmd.set("all_states", 1, protein_name)
+
+
+def caverColour(rank):
+
+    rank = max(0, int(rank))
+    if rank < len(CAVER_PRIMARIES):
+        name = "caver%d" % (rank + 1)
+        rgb = CAVER_PRIMARIES[rank]
+    else:
+        step = rank - len(CAVER_PRIMARIES)
+        saturation, value = SATURATION_VALUE[
+            step % len(SATURATION_VALUE)
+        ]
+        name = "gen%d" % rank
+        rgb = colorsys.hsv_to_rgb((HUE_OFFSET + (step + 1) * GOLDEN_ANGLE) % 1.0,saturation,value)
+    cmd.set_color(name, list(rgb))
+    return name
+
+UNCLUSTERED = "grey60"
+
+def clusterColour(cluster):
+
+    if str(cluster).lower() in ("noise", "-1"):
+        return UNCLUSTERED
+    try:
+        return caverColour(int(cluster))
+    except (TypeError, ValueError):
+        raise ValueError("Cluster labels must be integers or 'noise'; got %r" % cluster)
+
+def number2Letter(number):
+    number = int(number)
+    if number == -1:
+        return "ZZZZ"
+    if number < 0:
+        raise ValueError("Cluster labels other than -1 must be non-negative.")
+
+    n = number + 1
+    letters = ""
+
+    while n > 0:
+        n, remainder = divmod(n - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+
+    if len(letters) > 4:
+        raise ValueError( "Cluster label %d exceeds the four-character segi limit." % number)
+    return letters
+
+by_chl_frame = {}
+frame_ranks = {}
+
+for fname in files:
+    frame, rest = splitFrame(fname)
+
+    if frame is None:
+        continue
+
+    chl_rank = channelRank(rest)
+
+    if chl_rank is not None:
+        frame_ranks.setdefault(frame, []).append(chl_rank)
+        by_chl_frame.setdefault(frame, {})[chl_rank] = fname
+
+
+if not by_chl_frame:
+    parser.error("Files matched the glob, but no frame/channel information could "
+                "be parsed from their filenames.")
+
+# Sort frames and channel ranks explicitly so label assignment does not
+# depend on filesystem/glob ordering.
+channel_order = []
+for frame in sorted(by_chl_frame):
+    frame_channels = by_chl_frame[frame]
+
+    for rank in sorted(frame_channels):
+        channel_order.append(frame_channels[rank])
+
+n_channels = len(channel_order)
+print("Found %d channels across %d frames." % (n_channels, len(by_chl_frame)))
+
+
+def readLabelFile(path):
+    # Parameters
+    # path : str or os.PathLike
+    #     Path to the TSV label file.
+    # Returns
+    # clusterings : list of (str, list[int])
+    #     One ``(name, labels)`` tuple for each clustering column.
+    #     If a header is present, its column names are used as clustering names.
+    #     For a headerless single-column file, the filename stem is used.
+    #     For a headerless multi-column file, names are generated as
+    #     ``<filename>_1``, ``<filename>_2``, etc.
+    # Raises
+    # ValueError
+    #     If the file does not exist, contains no label data, has inconsistent
+    #     column counts, contains non-integer labels, has duplicate/empty column
+    #     names, or does not contain exactly ``n_channels`` label rows.
+    import csv
+
+    if not os.path.isfile(path):
+        raise ValueError("Label file does not exist: %s" % path)
+
+    raw_rows = []
+
+    with open(path, "r", newline="") as handle:
+        reader = csv.reader(handle, delimiter="\t")
+
+        for row in reader:
+            # Strip whitespace around individual fields.
+            row = [field.strip() for field in row]
+
+            # Ignore completely empty rows.
+            if not row or all(field == "" for field in row):
+                continue
+
+            # Ignore comment rows.
+            if row[0].startswith("#"):
+                continue
+
+            raw_rows.append(row)
+
+    if not raw_rows:
+        raise ValueError("No labels found in %s" % path)
+
+    try:
+        [int(value) for value in raw_rows[0]]
+        header = None
+        data_rows = raw_rows
+    except ValueError:
+        header = raw_rows[0]
+        data_rows = raw_rows[1:]
+
+    if not data_rows:
+        raise ValueError("Label file %s contains a header but no label rows." % path)
+
+    ncols = len(data_rows[0])
+
+    if ncols == 0:
+        raise ValueError("No label columns found in %s" % path)
+
+    for row_num, row in enumerate(data_rows,start=2 if header is not None else 1):
+        if len(row) != ncols:
+            raise ValueError("Inconsistent number of columns in %s at row %d: "
+                "expected %d, found %d."
+                % (path, row_num, ncols, len(row)))
+
+    rows = []
+
+    for row_num, row in enumerate(data_rows,start=2 if header is not None else 1):
+        try:
+            rows.append([int(value) for value in row])
+        except ValueError:
+            raise ValueError("Non-integer cluster label in %s at row %d:\n%s"
+                % (path, row_num, "\t".join(row)))
+
+    if len(rows) != n_channels:
+        raise ValueError("%s contains %d label rows, but %d channels were found."
+            % (path, len(rows), n_channels))
+    if header is not None:
+        if len(header) != ncols:
+            raise ValueError("Header in %s contains %d names but the data contain "
+            "%d columns."
+            % (path, len(header), ncols))
+
+        if any(not name for name in header):
+            raise ValueError( "Header in %s contains an empty column name." % path)
+
+        if len(set(header)) != len(header):
+            raise ValueError("Header in %s contains duplicate clustering names." % path)
+
+    base = os.path.splitext(os.path.basename(path))[0]
+    clusterings = []
+
+    for col in range(ncols):
+        if header is not None:
+            name = header[col]
+        elif ncols == 1:
+            name = base
+        else:
+            name = "%s_%d" % (base, col + 1)
+
+        labels = [row[col] for row in rows]
+
+        clusterings.append((name, labels))
+
+    return clusterings
+
+def freePath(path):
+    if not os.path.exists(path):
+        return path
+
+    stem, ext = os.path.splitext(path)
+    n = 1
+
+    while os.path.exists("%s_%d%s" % (stem, n, ext)):
+        n += 1
+
+    return "%s_%d%s" % (stem, n, ext)
+
+def safeName(name):
+
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name))
+    return name.strip("_.") or "clustering"
+
+def makeOutputPath(base_path, clustering_name=None, multiple=False):
+
+    stem, ext = os.path.splitext(base_path)
+
+    if ext.lower() != ".pse":
+        # Preserve an unrecognized extension as part of the stem rather
+        # than producing a non-PSE session filename.
+        if ext:
+            stem = base_path
+        ext = ".pse"
+
+    if multiple and clustering_name is not None:
+        path = "%s_%s%s" % (stem,safeName(clustering_name),ext)
+    else:
+        path = stem + ext
+
+    return freePath(path)
+
+channel_objects = []
+
+for i, fname in enumerate(channel_order):
+    # Prefix the object name with its global channel index. This guarantees
+    # unique PyMOL object names even if basenames happen to collide.
+    basename = os.path.splitext(os.path.basename(fname))[0]
+    name = "chn_%06d_%s" % (i, basename)
+
+    cmd.load(fname, name)
+    channel_objects.append(name)
+
+clusterings = []
+
+if label_files:
+    for label_file in label_files:
+        clusterings.extend(readLabelFile(label_file))
+
+if not clusterings:
+    # No clustering was supplied. Display all channels in the default
+    # unclustered color and save one session.
+    for name in channel_objects:
+        cmd.color(UNCLUSTERED, name)
+        cmd.alter(name, "segi='ZZZZ'")
+
+    cmd.rebuild()
+    cmd.bg_color("white")
+    cmd.zoom()
+
+    output_path = makeOutputPath(out_file)
+    cmd.save(output_path)
+
+    print("Saved session: %s" % output_path)
+
+else:
+    multiple = len(clusterings) > 1
+
+    for clustering_name, labels in clusterings:
+
+        print("Applying clustering '%s' (%d labels)." % (clustering_name, len(labels)))
+
+        for name, label in zip(channel_objects, labels):
+            cname = clusterColour(label)
+            segname = number2Letter(label)
+
+            cmd.color(cname, name)
+            cmd.alter(name, "segi='%s'" % segname)
+
+        cmd.rebuild()
+        cmd.bg_color("white")
+        cmd.zoom()
+
+        output_path = makeOutputPath(out_file,clustering_name=clustering_name,multiple=multiple,)
+        cmd.save(output_path)
+
+        print("Saved clustering '%s': %s" % (clustering_name, output_path))
+"""
 
 _VIS_CHANNELS_TRAJ_SCRIPT = r"""
 import glob
@@ -13839,79 +15651,134 @@ import os
 import re
 import sys
 import colorsys
- 
-# --- args ---
+
+# ---------------------------------------------------------------------------
+# Unified state-based viewer
+#
+# This viewer accepts BOTH trajectory representations used by ProDy/CaviTracer:
+#
+#   1. One multi-MODEL PQR:
+#        channels_frames.pqr
+#
+#   2. One PQR per frame:
+#        channels100_sp0_chl0.pqr
+#        channels100_sp0_chl1.pqr
+#        channels101_sp0_chl0.pqr
+#        ...
+#
+# The two paths end in the same PyMOL representation: one object per channel
+# rank (or cluster), one state per frame.
+#
+# For per-frame cluster files, several files may legitimately have the same
+# cluster id AND frame number.  They are accumulated in a list and all of their
+# geometry is placed into that cluster's state.  Nothing is discarded.
+# ---------------------------------------------------------------------------
+TRAJ_EXTENSIONS = ('.dcd', '.xtc', '.trr', '.nc', '.dtr')
+
 args = [a for a in sys.argv[1:] if a != "--"]
-file_pattern = next((a for a in args if not os.path.isfile(a)), "*.pqr")
-protein_file = next((a for a in args if os.path.isfile(a)), None)
- 
+file_pattern = None
+protein_file = None
+traj_file = None
+
+# Existing files are inputs; the first non-file argument is the glob pattern.
+for arg in args:
+    lower = arg.lower()
+    if os.path.isfile(arg) and lower.endswith(TRAJ_EXTENSIONS):
+        if traj_file is None:
+            traj_file = arg
+    elif os.path.isfile(arg) and lower.endswith(".pse"):
+        out_file = arg
+    elif os.path.isfile(arg):
+        if protein_file is None:
+            protein_file = arg
+    elif file_pattern is None:
+        file_pattern = arg
+if file_pattern is None:
+    file_pattern = "*.pqr"
+
 files = sorted(glob.glob(file_pattern))
 if not files:
     print("No files matched %r" % file_pattern)
     raise SystemExit
- 
+
+# If the command line supplied a glob plus a protein, the protein is the input
+# file that is not itself a channel PQR.  Otherwise use the first non-PQR file.
+
 if protein_file:
     protein_name = os.path.splitext(os.path.basename(protein_file))[0]
     cmd.load(protein_file, protein_name)
     cmd.hide("everything", protein_name)
     cmd.show("cartoon", protein_name)
-    cmd.set("all_states", 1, protein_name)  # same protein visible in every state
- 
-# --- colour palette: identical to vis_channels.py, so rank 0 is blue in both ---
+    cmd.set("all_states", 1, protein_name)
+
+
 CAVER_PRIMARIES = [(0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0),
                    (0.0, 1.0, 1.0), (1.0, 1.0, 0.0), (1.0, 0.0, 1.0)]
 GOLDEN_ANGLE = (3.0 - 5.0 ** 0.5) / 2.0
 HUE_OFFSET = 0.796
 SATURATION_VALUE = ((0.95, 0.55), (0.65, 0.65), (0.65, 0.95))
- 
+
+
 def caverColour(rank):
+    rank = max(0, int(rank))
     if rank < len(CAVER_PRIMARIES):
         name, rgb = "caver%d" % (rank + 1), CAVER_PRIMARIES[rank]
     else:
         step = rank - len(CAVER_PRIMARIES)
         saturation, value = SATURATION_VALUE[step % len(SATURATION_VALUE)]
         name = "gen%d" % rank
-        rgb = colorsys.hsv_to_rgb((HUE_OFFSET + (step + 1) * GOLDEN_ANGLE) % 1.0,
-                                  saturation, value)
+        rgb = colorsys.hsv_to_rgb(
+            (HUE_OFFSET + (step + 1) * GOLDEN_ANGLE) % 1.0,
+            saturation, value)
     cmd.set_color(name, list(rgb))
     return name
- 
-# --- split "channels100_sp0_chl10.pqr" into (frame=100, rest="_sp0_chl10.pqr") ---
+
+
+UNCLUSTERED = "grey60"
+
+
+def clusterColour(cluster):
+    if str(cluster).lower() in ("noise", "-1"):
+        cmd.set_color("noise", [0.6, 0.6, 0.6])
+        return UNCLUSTERED
+    try:
+        return caverColour(int(cluster))
+    except (TypeError, ValueError):
+        return caverColour(abs(hash(str(cluster))) % 1000)
+
+
+# ---------------------------------------------------------------------------
+# Filename metadata for the per-frame representation
+# ---------------------------------------------------------------------------
 FRAME_PREFIX = re.compile(r'^[A-Za-z]+(\d+)')
- 
+CHANNEL_RANK = re.compile(r'chl(\d+)')
+LINK_RANK = re.compile(r'lnk(\d+)')
+CLUSTER_ID = re.compile(r'clid(\w+)')
+
+
 def splitFrame(filename):
     base = os.path.basename(filename)
     match = FRAME_PREFIX.match(base)
     if not match:
         return None, base
-    frame = int(match.group(1))
-    return frame, base[match.end():]
- 
-# Rank patterns run against `rest` ONLY (frame number already stripped), so
-# there is no frame-number/rank collision the way there would be running
-# these against the whole filename.
-CHANNEL_RANK = re.compile(r'chl(\d+)')
-LINK_RANK = re.compile(r'lnk(\d+)')
- 
+    return int(match.group(1)), base[match.end():]
+
+
 def channelRank(rest):
     match = CHANNEL_RANK.search(rest)
     return int(match.group(1)) if match else None
- 
+
+
 def linkRank(rest):
     match = LINK_RANK.search(rest)
     return int(match.group(1)) if match else None
- 
-# Cluster id, added by a post-hoc rename pass (e.g. "..._chl3_clid7.pqr" or
-# "..._chl3_clidnoise.pqr" for HDBSCAN's -1/noise label). Kept as a string so
-# "noise" and numeric ids share one lookup; numeric ids are cast to int only
-# when handed to caverColour, so cluster 7 gets the same colour as rank 7.
-CLUSTER_ID = re.compile(r'clid(\w+)')
- 
+
+
 def clusterId(rest):
     match = CLUSTER_ID.search(rest)
     return match.group(1) if match else None
- 
-# --- gather, per rank (and per cluster id, if present), the file per frame ---
+
+# gather, per rank (and per cluster id, if present), the file per frame 
 by_chl_rank = {}      # rank -> {frame: filename}, used when no file carries a clid tag
 by_cluster = {}       # cluster id (str) -> {frame: filename}, used once any file does
 by_lnk_rank = {}      # rank -> {frame: filename}
@@ -13919,148 +15786,380 @@ skipped_dumps = 0
 collisions = []          # (cluster_id, frame, kept_fname, dropped_fname)
 unclustered_chl = []     # (rank, frame, fname) for chl files with no clid tag
 any_clustered = False
- 
-for fname in files:
-    frame, rest = splitFrame(fname)
-    if frame is None:
-        continue
-    chl_rank = channelRank(rest)
-    if chl_rank is not None:
-        by_chl_rank.setdefault(chl_rank, {})[frame] = fname
-        cluster = clusterId(rest)
-        if cluster is not None:
-            any_clustered = True
-            slot = by_cluster.setdefault(cluster, {})
-            if frame in slot:
-                # Two channels in the same frame landed in the same cluster --
-                # they can't both occupy one state of one multi-state object.
-                # Keep the first (by sorted filename order) and report the rest
-                # rather than silently overwriting; merging their geometry into
-                # one object is possible but is a judgement call left to you.
-                collisions.append((cluster, frame, slot[frame], fname))
-            else:
-                slot[frame] = fname
-        else:
-            # No clid tag on this particular file (a partially-clustered run,
-            # e.g. a rename pass that only tagged clustered channels and left
-            # noise/unmatched ones alone). Recorded so it isn't silently
-            # dropped once clustering mode kicks in below.
-            unclustered_chl.append((chl_rank, frame, fname))
-        continue
-    lnk_rank = linkRank(rest)
-    if lnk_rank is not None:
-        by_lnk_rank.setdefault(lnk_rank, {})[frame] = fname
-        continue
-    # rest is "" (bare "<stem><frame>.pqr") or "_links.pqr" -- the unranked
-    # per-frame dumps; skipped, same reasoning as vis_channels.py's UNRANKED
-    # handling (they duplicate the per-object files and carry no rank).
-    skipped_dumps += 1
- 
-if collisions:
-    print("Warning: %d cluster/frame collision(s) -- kept the first file, "
-          "dropped the rest:" % len(collisions))
-    for cluster, frame, kept, dropped in collisions:
-        print("  cluster %s, frame %d: kept %s, dropped %s"
-              % (cluster, frame, os.path.basename(kept), os.path.basename(dropped)))
- 
-all_frames = sorted({frame for ranks in (by_chl_rank, by_lnk_rank, by_cluster)
-                     for frame_map in ranks.values() for frame in frame_map})
-if not all_frames:
-    print("No ranked (chl/lnk) files found among the %d file(s) matched; "
-          "only bare per-frame dumps (%d skipped)." % (len(files), skipped_dumps))
-    raise SystemExit
-frame_to_state = {frame: i + 1 for i, frame in enumerate(all_frames)}
-n_states = len(all_frames)
-if any_clustered:
-    print("Found %d frame(s), %d cluster(s), %d link rank(s) "
-          "(%d unranked dump file(s) skipped)."
-          % (n_states, len(by_cluster), len(by_lnk_rank), skipped_dumps))
-else:
-    print("Found %d frame(s), %d channel rank(s), %d link rank(s) "
-          "(%d unranked dump file(s) skipped). No clid tags found -- "
-          "grouping by rank; re-run the rename pass first to group by cluster."
-          % (n_states, len(by_chl_rank), len(by_lnk_rank), skipped_dumps))
- 
-# --- build one discrete multi-state object per rank ---
-def loadPqrState(fname, tmp):
-    cmd.load(fname, tmp)
+
+
+
+PQR_KINDS = {"channel": "Tunnel", "pore": "Pore", "link": "Path",
+             "cavity": "Cavity"}
+
+
+def isMultiModelPQR(path):
+    with open(path) as handle:
+        for line in handle:
+            if line.startswith("MODEL"):
+                return True
+    return False
+
+
+def pqrToPdbText(lines):
+    '''Convert PQR atom records to PDB-like records with radius in B-factor.
+
+    read_pdbstr() then gives us exact per-atom vdw values via ``vdw = b``.
+    '''
+    out = []
+    for line in lines:
+        if not line.startswith(("ATOM", "HETATM")):
+            continue
+        if line[17:20] not in ("FIL", "NIL"):
+            continue
+        try:
+            radius = float(line.split()[-1])
+            x = float(line[30:38])
+            y = float(line[38:46])
+            z = float(line[46:54])
+            serial = int(line[6:11]) if line[6:11].strip() else len(out) + 1
+            resid = int(line[22:26]) if line[22:26].strip() else len(out) + 1
+            chain = line[21:22] or " "
+        except (ValueError, IndexError):
+            continue
+        out.append(
+            "ATOM  %5d  H   FIL %1s%4d    %8.3f%8.3f%8.3f%6.2f%6.2f\n"
+            % (serial, chain, resid, x, y, z, 1.00, radius))
+    return "".join(out)
+
+
+def loadPqrObject(fname, obj):
+    '''Load one per-frame PQR into a temporary PyMOL object and set radii.'''
+    cmd.load(fname, obj)
     radii = []
-    with open(fname) as f:
-        for line in f:
+    with open(fname) as handle:
+        for line in handle:
             if line.startswith(("ATOM", "HETATM")):
-                radii.append(float(line.split()[-1]))
+                try:
+                    radii.append(float(line.split()[-1]))
+                except ValueError:
+                    pass
     if radii:
-        cmd.alter(tmp, "vdw = radii.pop(0)", space={'radii': radii})
- 
-def buildMultistate(rank_map, obj, colour):
-    tmp = obj + "_tmp"
+        cmd.alter(obj, "vdw = radii.pop(0)", space={'radii': radii})
+    return obj
+
+
+def addFilesToState(fnames, obj, state):
+    '''Put all PQRs in *fnames* into one state of *obj*.
+
+    Multiple files are deliberately combined rather than treated as a
+    collision. This is the important case for clustered trajectories: several
+    channels from one frame can belong to the same cluster.
+    '''
+    temps = []
+    try:
+        for i, fname in enumerate(fnames):
+            tmp = "__vis_tmp_%d_%d" % (state, i)
+            # Avoid stale names from a partially interrupted PyMOL run.
+            if tmp in cmd.get_names("objects"):
+                cmd.delete(tmp)
+            loadPqrObject(fname, tmp)
+            temps.append(tmp)
+        if temps:
+            selection = " or ".join("%s" % name for name in temps)
+            cmd.create(obj, selection, 1, state, 1)
+    finally:
+        for tmp in temps:
+            if tmp in cmd.get_names("objects"):
+                cmd.delete(tmp)
+
+
+def buildMultistate(file_map, obj, colour, frame_to_state, n_states):
+    '''file_map: frame -> filename or frame -> list of filenames.'''
     n_written = 0
-    for frame, fname in sorted(rank_map.items()):
-        state_index = frame_to_state[frame]
-        loadPqrState(fname, tmp)
-        cmd.create(obj, tmp, 1, state_index)
-        cmd.delete(tmp)
+    for frame in sorted(file_map):
+        value = file_map[frame]
+        fnames = value if isinstance(value, (list, tuple)) else [value]
+        fnames = [f for f in fnames if f]
+        if not fnames:
+            continue
+        addFilesToState(fnames, obj, frame_to_state[frame])
         n_written += 1
+
     cmd.hide("everything", obj)
     cmd.show("spheres", obj)
     cmd.color(colour, obj)
-    print("  %-10s %s  present in %d/%d frame(s)" % (obj, colour, n_written, n_states))
+    print("  %-20s %s  present in %d/%d frame(s)" %
+          (obj, colour, n_written, n_states))
     return n_written
- 
-UNCLUSTERED = "grey60"   # for HDBSCAN's noise label, same role as vis_channels.py's UNRANKED
- 
-def clusterColour(cluster):
-    if cluster == "noise":
-        cmd.set_color("noise", [0.6, 0.6, 0.6])
-        return UNCLUSTERED
-    try:
-        return caverColour(int(cluster))
-    except ValueError:
-        # A non-numeric, non-"noise" label (a custom string tag): hash it into
-        # the palette so it's still a stable colour, just not one aligned with
-        # any particular numeric rank.
-        return caverColour(abs(hash(cluster)) % 1000)
- 
-built_chl, built_lnk = [], []
-if any_clustered:
-    # Every chl-ranked file that never got a clid tag (a partially-clustered
-    # run) still has to go somewhere: group it by its own rank, same as the
-    # no-clustering path, rather than silently losing it.
-    for rank, frame, fname in unclustered_chl:
-        by_cluster.setdefault("rank%d_untagged" % rank, {})[frame] = fname
-    for cluster in sorted(by_cluster, key=lambda c: (c == "noise", c)):
-        obj = "cl%s" % cluster
-        if buildMultistate(by_cluster[cluster], obj, clusterColour(cluster)):
-            built_chl.append(obj)
-            if cluster == "noise":
-                cmd.disable(obj)   # off by default, matching UNRANKED handling elsewhere
+
+
+# ---------------------------------------------------------------------------
+# Representation A: one multi-MODEL PQR
+# ---------------------------------------------------------------------------
+def loadMultiModelPQR(path):
+    '''Build one stateful object per channel/link/cavity from a multi-MODEL PQR.'''
+    models = []
+    current = None
+    current_kind = "channel"
+    kind_by_key = {}
+
+    with open(path) as handle:
+        for line in handle:
+            if line.startswith("MODEL"):
+                number_text = line[5:].strip()
+                try:
+                    number = int(number_text)
+                except ValueError:
+                    number = len(models) + 1
+                current = {"number": number, "records": {}}
+                models.append(current)
+                continue
+
+            if line.startswith("REMARK"):
+                words = line.split()
+                if len(words) > 2 and words[1] in PQR_KINDS:
+                    current_kind = words[1]
+                continue
+
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            if line[17:20] != "FIL":
+                continue
+
+            if current is None:
+                current = {"number": 1, "records": {}}
+                models.append(current)
+
+            try:
+                chain = line[21:22] or " "
+                resid = int(line[22:26])
+                radius = float(line.split()[-1])
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+            except (ValueError, IndexError):
+                continue
+
+            key = (chain, resid)
+            kind = "cavity" if chain == "C" else current_kind
+            kind_by_key.setdefault(key, kind)
+            current["records"].setdefault(key, []).append((x, y, z, radius))
+
+    if not models:
+        print("No FIL records found in %s" % path)
+        return [], [], 0
+
+    frame_numbers = [m["number"] for m in models]
+    frame_to_state = {frame: i + 1 for i, frame in enumerate(frame_numbers)}
+
+    # Stable object order: cavities first, then everything else by residue id.
+    keys = sorted(kind_by_key, key=lambda k: (kind_by_key[k] != "cavity", k[0], k[1]))
+    built = []
+    groups = {}
+
+    for key in keys:
+        kind = kind_by_key[key]
+        rank = max(0, key[1] - 1)
+        obj_kind = PQR_KINDS.get(kind, "Tunnel")
+        obj = "%s%d" % (kind, rank)
+        if obj in cmd.get_names("objects"):
+            suffix = 1
+            base = obj
+            while obj in cmd.get_names("objects"):
+                obj = base + str(suffix)
+                suffix += 1
+
+        colour = caverColour(rank)
+        written = 0
+        for state, model in enumerate(models, start=1):
+            samples = model["records"].get(key)
+            if not samples:
+                continue
+            lines = []
+            for i, (x, y, z, radius) in enumerate(samples, start=1):
+                lines.append(
+                    "ATOM  %5d  H   FIL %1s%4d    %8.3f%8.3f%8.3f%6.2f%6.2f\n"
+                    % (i, key[0], i, x, y, z, 1.00, radius))
+            cmd.read_pdbstr("".join(lines), obj, state=state, discrete=1)
+            cmd.alter(obj, "vdw = b")
+            cmd.set_title(obj, state, "frame %s" % model["number"])
+            written += 1
+
+        cmd.hide("everything", obj)
+        if kind == "cavity":
+            cmd.set("surface_mode", 1, obj)
+            cmd.show("surface", obj)
+        else:
+            cmd.show("spheres", obj)
+        cmd.color(colour, obj)
+        groups.setdefault(obj_kind, []).append(obj)
+        built.append(obj)
+        print("  %-20s %s  (%s, %d/%d frame(s))" %
+              (obj, colour, obj_kind, written, len(models)))
+
+    return built, groups, len(models)
+
+
+# ---------------------------------------------------------------------------
+# Representation B: one PQR file per frame
+# ---------------------------------------------------------------------------
+def loadPerFramePQRs(files):
+    by_chl_rank = {}
+    by_cluster = {}
+    by_lnk_rank = {}
+    unclustered_chl = []
+    skipped_dumps = 0
+    any_clustered = False
+
+    # IMPORTANT: values in by_cluster are LISTS. Multiple channels from the
+    # same frame can belong to the same cluster and all must be retained.
+    for fname in files:
+        frame, rest = splitFrame(fname)
+        if frame is None:
+            continue
+
+        chl_rank = channelRank(rest)
+        if chl_rank is not None:
+            by_chl_rank.setdefault(chl_rank, {}).setdefault(frame, []).append(fname)
+            cluster = clusterId(rest)
+            if cluster is not None:
+                any_clustered = True
+                by_cluster.setdefault(cluster, {}).setdefault(frame, []).append(fname)
+            else:
+                unclustered_chl.append((chl_rank, frame, fname))
+            continue
+
+        lnk_rank = linkRank(rest)
+        if lnk_rank is not None:
+            by_lnk_rank.setdefault(lnk_rank, {}).setdefault(frame, []).append(fname)
+            continue
+
+        skipped_dumps += 1
+
+    all_frames = sorted({frame for maps in (by_chl_rank, by_lnk_rank, by_cluster)
+                         for rank_map in maps.values() for frame in rank_map})
+    if not all_frames:
+        print("No ranked channel/link files found among %d file(s); "
+              "%d unranked dump(s) skipped." % (len(files), skipped_dumps))
+        return [], [], 0
+
+    frame_to_state = {frame: i + 1 for i, frame in enumerate(all_frames)}
+    n_states = len(all_frames)
+
+    print("Found %d frame(s), %d channel rank(s), %d cluster(s), %d link rank(s) "
+          "(%d unranked dump(s) skipped)." %
+          (n_states, len(by_chl_rank), len(by_cluster), len(by_lnk_rank),
+           skipped_dumps))
+
+    if any_clustered:
+        # Preserve partially tagged runs. Untagged channels get a unique
+        # synthetic cluster key based on their rank, and values are lists just
+        # like the real clusters.
+        for rank, frame, fname in unclustered_chl:
+            key = "rank%d_untagged" % rank
+            by_cluster.setdefault(key, {}).setdefault(frame, []).append(fname)
+
+    built_chl, built_lnk = [], []
+
+    if any_clustered:
+        for cluster in sorted(by_cluster, key=lambda c: (str(c).lower() == "noise", str(c))):
+            obj = "cl%s" % cluster
+            colour = clusterColour(cluster)
+            if buildMultistate(by_cluster[cluster], obj, colour,
+                               frame_to_state, n_states):
+                built_chl.append(obj)
+                if str(cluster).lower() in ("noise", "-1"):
+                    cmd.disable(obj)
+    else:
+        for rank in sorted(by_chl_rank):
+            obj = "chl%d" % rank
+            if buildMultistate(by_chl_rank[rank], obj, caverColour(rank),
+                               frame_to_state, n_states):
+                built_chl.append(obj)
+
+    for rank in sorted(by_lnk_rank):
+        obj = "lnk%d" % rank
+        if buildMultistate(by_lnk_rank[rank], obj, caverColour(rank),
+                           frame_to_state, n_states):
+            built_lnk.append(obj)
+
+    if built_chl:
+        cmd.group("chnl_grp", " ".join(built_chl))
+    if built_lnk:
+        cmd.group("link_grp", " ".join(built_lnk))
+        cmd.disable("link_grp")
+
+    cmd.mset("1 -%d" % n_states)
+    return built_chl, built_lnk, n_states
+
+
+# ---------------------------------------------------------------------------
+# Dispatch: the same state-building viewer handles either representation.
+# ---------------------------------------------------------------------------
+if len(files) == 1 and files[0].lower().endswith(".pqr") and isMultiModelPQR(files[0]):
+    print("Detected multi-MODEL PQR: %s" % files[0])
+    built, groups, n_states = loadMultiModelPQR(files[0])
+    for kind, objects in sorted(groups.items()):
+        group_name = {"Tunnel": "chnl_grp", "Pore": "pore_grp",
+                      "Path": "link_grp", "Cavity": "cav_grp"}.get(
+                          kind, kind.lower() + "_grp")
+        if objects:
+            cmd.group(group_name, " ".join(objects))
+    cmd.mset("1 -%d" % n_states)
+    print("Success: %d object(s) across %d state(s)." % (len(built), n_states))
 else:
-    for rank in sorted(by_chl_rank):
-        obj = "chl%d" % rank
-        if buildMultistate(by_chl_rank[rank], obj, caverColour(rank)):
-            built_chl.append(obj)
-for rank in sorted(by_lnk_rank):
-    obj = "lnk%d" % rank
-    if buildMultistate(by_lnk_rank[rank], obj, caverColour(rank)):
-        built_lnk.append(obj)
- 
-if built_chl:
-    cmd.group("chnl_grp", " ".join(built_chl))
-if built_lnk:
-    cmd.group("link_grp", " ".join(built_lnk))
-    cmd.disable("link_grp")   # off by default, matching vis_channels.py's tun_grp
- 
+    # If a single ordinary PQR was supplied, it is treated as one frame.
+    built_chl, built_lnk, n_states = loadPerFramePQRs(files)
+    print("Success: %d channel/cluster object(s), %d link object(s) across %d state(s)." %
+          (len(built_chl), len(built_lnk), n_states))
+
 cmd.rebuild()
 cmd.set("sphere_scale", 1.0)
 cmd.set("sphere_quality", 2)
 cmd.bg_color("white")
 cmd.zoom()
-cmd.mset("1 -%d" % n_states)
-print("Success: %d channel object(s), %d link object(s) built across %d state(s). "
-      "Step through frames with the state slider or the movie controls." %
-      (len(built_chl), len(built_lnk), n_states))
-cmd.save('traj_ouit.pse')      
-      """
+
+def freePath(path):
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    n = 1
+    while os.path.exists("%s_%d%s" % (stem, n, ext)):
+        n += 1
+    return "%s_%d%s" % (stem, n, ext)
+
+out_pse = freePath('traj_out.pse')
+cmd.save(out_file if 'out_file' in locals() else out_pse)
+print("Saved session: %s" % out_pse)
+"""
+
+
+def _writeVisTrajScript(directory, pattern='channels*_sp*_chl*.pqr', flat=False):
+    """Write the unified state-based PyMOL trajectory viewer.
+
+    The viewer accepts either a multi-MODEL PQR or a glob of per-frame PQRs.
+    This function is retained as the trajectory-specific writer API for
+    backwards compatibility; the generated viewer is now the same state
+    pathway used for both representations.
+    """
+    import os
+
+    path = os.path.join(str(directory), 'vis_channels_traj.py')
+    usage = ('`pymol vis_channels_traj.py -- "{0}" [protein.pdb]`'.format(pattern))
+    script = None
+    if flat:
+        script = _VIS_CHANNELS_FLAT_TRAJ_SCRIPT
+    else:
+        script = _VIS_CHANNELS_TRAJ_SCRIPT
+
+    if os.path.exists(path):
+        LOGGER.info('View the trajectory with the PyMOL viewer already in {0}: '
+                    '{1}.'.format(os.path.dirname(path), usage))
+        return
+    try:
+        with open(path, 'w') as script_file:
+            script_file.write(script)
+    except (IOError, OSError) as err:
+        _warn("Could not write the PyMOL trajectory viewer {0}: {1}".format(path, err))
+    else:
+        LOGGER.info('Wrote the PyMOL trajectory viewer {0}. View the output with '
+                    '{1}.'.format(path, usage))
 
 
 def _writeVisScript(directory, pattern='chl*.pqr'):
@@ -14100,29 +16199,799 @@ def _writeVisScript(directory, pattern='chl*.pqr'):
         LOGGER.info('Wrote the PyMOL viewer {0}. View the output with '
                     '{1}.'.format(path, usage))
 
-def _writeVisTrajScript(directory, pattern='channels*_sp*_chl*.pqr'):
-    """Leave ``vis_channels_traj.py`` in ``directory`` unless it is already there.
 
-    Counterpart of :func:`_writeVisScript` for a run over multiple frames:
-    channel PQR files are stored together in one directory and the frame number
-    is encoded in each filename as ``channels<frame>_..._chl<channel>.pqr``.
-    """
-    import os
+def _writeViewerPQR(result_file, objects, object_type, surface, num_samples):
+    """Write *objects* to the PQR a viewer script draws: channels, pores or links
+    as their spheres, surface cavities as their markers, and connected results as
+    both, the cavities on chain C and the channels on chain H.
 
-    path = os.path.join(str(directory), 'vis_channels_traj.py')
+    One writer for the VMD, PyMOL and ChimeraX functions, which all draw these
+    same records. *surface* is what :func:`calcSurfaceCavities` returned, needed
+    only for the two cavity types."""
 
-    usage = ('`pymol vis_channels_traj.py -- "{0}" [protein.pdb]`'.format(pattern))
+    if object_type in ('channels', 'pores', 'links'):
 
-    if os.path.exists(path):
-        LOGGER.info('View the trajectory with the PyMOL viewer already in {0}: '
-                        '{1}.'.format(os.path.dirname(path), usage))
-        return
-    try:
-        with open(path, 'w') as script_file:
-            script_file.write(_VIS_CHANNELS_TRAJ_SCRIPT)
-    except (IOError, OSError) as err:
+        labels = {'channels': 'channel', 'pores': 'pore', 'links': 'link'}
+        label = labels[object_type]
 
-        _warn("Could not write the PyMOL trajectory viewer {0}: {1}".format(path, err))
+        with open(str(result_file), 'w') as handle:
+            atom_index = 1
+
+            for object_index, obj in enumerate(objects):
+                lines, written = ChannelCalculator._channelRecords(
+                    object_index, obj, atom_index, num_samples,
+                    label=label, name_sites=True)
+
+                handle.writelines(lines)
+                handle.write("\n")
+                atom_index += written
+
+    elif object_type == 'surface_cavities':
+
+        vertices = np.asarray(surface[4])
+        atom_index = 1
+        drawn = []
+
+        for cavity in objects:
+            tetrahedra = cavity.tetrahedra
+
+            if tetrahedra is None or len(tetrahedra) == 0:
+                continue
+
+            drawn.append((len(drawn), cavity,
+                          vertices[np.asarray(tetrahedra, dtype=np.intp)]))
+
+        if not drawn:
+            raise ValueError("No surface cavity contains points that can be visualized")
+
+        with open(str(result_file), 'w') as handle:
+            for cavity_index, cavity, centers in drawn:
+                lines, written = ChannelCalculator._cavityRecords(
+                    cavity_index, cavity, centers, atom_index)
+
+                handle.writelines(lines)
+                atom_index += written
+
     else:
-        LOGGER.info('Wrote the PyMOL trajectory viewer {0}. View the output with '
-                        '{1}.'.format(path, usage))
+        _saveConnectedCavityChannels(objects, surface, result_file, separate=False,
+                                    num_samples=num_samples)
+
+
+def writeVmdMultiModelScript(pqr_file, atoms, output_path='.',
+                             object_type='channels'):
+    """Write a VMD script for a PQR already on disk, such as the multi-model
+    one :func:`mergeFramesPQR` writes.
+
+    The script reads the PQR itself, one molecule per frame, each named for its
+    frame and coloured by rank as :func:`writeVmdCaviTracerScript` colours one
+    structure, and VMD's animation slider shows one frame at a time. A PQR of
+    one structure opens just as that function's own would.
+
+    Rank is all that ties an object to its namesakes in other frames: channel 3
+    of one frame and channel 3 of the next are the fourth cheapest of each, not
+    one channel followed through the trajectory.
+
+    :arg pqr_file: the PQR to draw, one structure or several frames.
+    :type pqr_file: str
+
+    :arg atoms: structure to draw the objects against. Its active coordinate
+        set is written, a single backdrop for every frame.
+    :type atoms: :class:`.Atomic`
+
+    :arg output_path: directory the structure and the script are written to.
+        The script finds the PQR where it is. Default is the current directory.
+    :type output_path: str
+
+    :arg object_type: what the PQR holds: ``'channels'`` (the default),
+        ``'pores'``, ``'links'``, ``'surface_cavities'`` or
+        ``'connected_cavities_channels'``, as in
+        :func:`writeVmdCaviTracerScript`.
+    :type object_type: str
+
+    :returns: paths to the PQR, the structure PDB and the VMD script
+    :rtype: tuple
+
+    Usage:
+    mergeFramesPQR('frames', 'channels_frames.pqr')
+    writeVmdMultiModelScript('channels_frames.pqr', atoms)
+
+    Next (bash console):
+    $ vmd -e vis_channels_frames.tcl"""
+
+    from pathlib import Path
+
+    _requireCoords(atoms)
+
+    object_types = ('channels', 'pores', 'links', 'surface_cavities',
+                    'connected_cavities_channels')
+    if object_type not in object_types:
+        raise ValueError('object_type must be one of {0}'.format(
+            ', '.join(repr(name) for name in object_types)))
+
+    pqr_file = Path(pqr_file)
+    if not pqr_file.is_file():
+        raise ValueError('no PQR at {0}'.format(pqr_file))
+
+    output_path = Path(output_path)
+    if not output_path.exists():
+        output_path.mkdir(parents=True)
+    if not output_path.is_dir():
+        raise ValueError("output_path must be a directory")
+
+    number = 0
+    while True:
+        suffix = '' if number == 0 else '-{0}'.format(number)
+        protein_file = output_path / ('protein' + suffix + '.pdb')
+        script_file = output_path / ('vis_' + pqr_file.stem + suffix + '.tcl')
+        if not (protein_file.exists() or script_file.exists()):
+            break
+        number += 1
+
+    # The active frame only: written whole, a trajectory's structure would come
+    # out as a model per frame, all of them drawn at once behind the channels.
+    writePDB(str(protein_file), atoms, csets=atoms.getACSIndex())
+    _writeVmdScript(script_file, protein_file, pqr_file, object_type)
+
+    LOGGER.info("CaviTracer VMD files written:")
+    LOGGER.info("    protein: {0}".format(protein_file))
+    LOGGER.info("    results: {0}".format(pqr_file))
+    LOGGER.info("    VMD script: {0}".format(script_file))
+    LOGGER.info("View the result with: vmd -e {0}".format(script_file.name))
+
+    return str(pqr_file), str(protein_file), str(script_file)
+    
+    
+def writePyMolCaviTracerScript(objects, atoms, object_type='channels',
+                               output_path='.', num_samples=5,
+                               output_format=None, surface=None):
+    """Prepare CaviTracer results for visualization in PyMOL.
+
+    This function writes CaviTracer objects in the tunnels-schema mmCIF format
+    or as a PQR, saves the supplied molecular structure as a PDB file, and
+    creates the CaviTracer PyMOL visualization script, which reads either.
+
+    The mmCIF is the one :func:`writeChannelsCIF` writes, and the PQR holds the
+    same records as the one :func:`writeVmdCaviTracerScript` and
+    :func:`writeChimeraXCaviTracerScript` write: every object in one file, told
+    apart by its residue number, which the viewer splits it by. Surface cavities
+    are drawn as the surface around their markers, as in those two.
+
+    :arg objects: CaviTracer objects to visualize: channels, pores, links,
+        surface cavities, or connected cavity-channel results.
+    :type objects: list or CaviTracer object
+
+    :arg atoms: Molecular structure to display together with the CaviTracer
+        results.
+    :type atoms: :class:`.Atomic`
+
+    :arg object_type: Type of CaviTracer result. Accepted values are
+        ``'channels'``, ``'pores'``, ``'links'``,
+        ``'surface_cavities'`` and ``'connected_cavities_channels'``.
+        Default is ``'channels'``.
+    :type object_type: str
+
+    :arg output_path: Directory in which the mmCIF or PQR, the PDB and the
+        PyMOL viewer are saved. Default is the current directory.
+    :type output_path: str or pathlib.Path
+
+    :arg num_samples: Number of samples per tetrahedron used for the channel,
+        pore, or link profile. Default is 5.
+    :type num_samples: int
+
+    :arg output_format: ``'mmcif'`` or ``'pqr'``, what the objects are written
+        as. Default is mmCIF for channels, pores and links, and PQR for surface
+        cavities and connected results, which have no mmCIF form.
+    :type output_format: str
+
+    :arg surface: Surface information returned by :func:`calcSurfaceCavities`.
+        Required for ``'surface_cavities'`` and ``'connected_cavities_channels'``.
+        Ignored for channels, pores and links.
+    :type surface: list or None
+
+    :returns: Paths to the mmCIF or PQR file, protein PDB file and PyMOL script.
+    :rtype: tuple
+
+    Usage:
+    atoms = parsePDB('1tqn').select("protein")
+    channels, surface = calcChannels(atoms)
+
+    For channels:
+    writePyMolCaviTracerScript(channels, protein)
+
+    For pores:
+    writePyMolCaviTracerScript(pores, protein, object_type='pores')
+
+    As a PQR:
+    writePyMolCaviTracerScript(channels, protein, output_format='pqr')
+
+    Surface cavities:
+    writePyMolCaviTracerScript(cavities, protein, object_type='surface_cavities',
+                               surface=cavity_surface)
+
+    Next (bash console):
+    $ pymol vis_channels.py -- protein.pdb channels.cif
+    $ pymol vis_channels.py -- protein.pdb channels.pqr   """
+
+    if PY3K:
+        from pathlib import Path
+    else:
+        from pathlib2 import Path
+
+    _requireCoords(atoms)
+
+    aliases = {
+        'channel': 'channels',
+        'channels': 'channels',
+        'pore': 'pores',
+        'pores': 'pores',
+        'link': 'links',
+        'links': 'links',
+        'cavity': 'surface_cavities',
+        'cavities': 'surface_cavities',
+        'surface_cavity': 'surface_cavities',
+        'surface_cavities': 'surface_cavities',
+        'connected': 'connected_cavities_channels',
+        'connected_cavity_channel': 'connected_cavities_channels',
+        'connected_cavities_channels': 'connected_cavities_channels'}
+
+    object_type = aliases.get(str(object_type).lower())
+
+    if object_type is None:
+        raise ValueError("object_type must be 'channels', 'pores', 'links', "
+                         "'surface_cavities' or 'connected_cavities_channels'")
+
+    cavity_types = ('surface_cavities', 'connected_cavities_channels')
+    if object_type in cavity_types:
+        if surface is None or len(surface) < 5:
+            raise ValueError("surface returned by calcSurfaceCavities() must be "
+                             "provided for object_type='{0}'.".format(object_type))
+
+    # Raises on anything but mmCIF or PQR, before a file is written.
+    if output_format is None:
+        output_format = 'pqr' if object_type in cavity_types else 'mmcif'
+    mmcif = _isMmcifFormat(output_format)
+    if mmcif and object_type in cavity_types:
+        raise ValueError("object_type='{0}' has no mmCIF form; leave output_format "
+                         "unset, or pass 'pqr'.".format(object_type))
+
+    if objects is None:
+        raise ValueError("objects cannot be None")
+
+    if isinstance(objects, list):
+        if not objects:
+            raise ValueError("objects contains no CaviTracer objects to visualize")
+    else:
+        objects = [objects]
+
+    output_path = Path(output_path)
+
+    if not output_path.exists():
+        output_path.mkdir(parents=True)
+
+    if not output_path.is_dir():
+        raise ValueError("output_path must be a directory")
+
+    result_stems = {'channels': 'channels', 'pores': 'pores', 'links': 'links',
+                    'surface_cavities': 'cavities',
+                    'connected_cavities_channels': 'connected_cavities_channels'}
+    result_stem = result_stems[object_type]
+    number = 0
+
+    while True:
+        suffix = '' if number == 0 else '-{0}'.format(number)
+
+        result_file = output_path / (
+            result_stem + suffix + ('.cif' if mmcif else '.pqr'))
+        protein_file = output_path / (
+            'protein' + suffix + '.pdb')
+
+        if not result_file.exists() and not protein_file.exists():
+            break
+
+        number += 1
+
+    writePDB(str(protein_file), atoms)
+
+    if not mmcif:
+        # The records the VMD and ChimeraX writers write: every object in one
+        # file, told apart by its residue number, which the viewer splits by.
+        _writeViewerPQR(result_file, objects, object_type, surface, num_samples)
+        written = result_file
+
+    elif object_type == 'channels':
+        written = writeChannelsCIF(result_file, objects,
+                            atoms=atoms, num_samples=num_samples)
+
+    elif object_type == 'pores':
+        written = writeChannelsCIF(result_file, objects, atoms=atoms,
+            object_type='pore', num_samples=num_samples)
+
+    else:
+        written = writeChannelsCIF(result_file, [], 
+                                    atoms=atoms, 
+                                    links=objects,
+                                    num_samples=num_samples)
+
+    if written is None:
+        raise ValueError("No CaviTracer objects were written to the mmCIF file")
+
+    written = Path(written)
+    _writeVisScript(written.parent, written.name)
+    script_file = written.parent / 'vis_channels.py'
+
+    LOGGER.info("CaviTracer PyMOL files written:")
+    LOGGER.info("    protein: {0}".format(protein_file))
+    LOGGER.info("    results: {0}".format(written))
+    LOGGER.info("    PyMOL script: {0}".format(script_file))
+    LOGGER.info(
+        "View the result with: pymol {0} -- {1} {2}".format(
+            script_file.name, protein_file.name, written.name))
+
+    return str(written), str(protein_file), str(script_file)
+    
+    
+def writePyMolMultiModelScript(
+        pqr_file,
+        atoms,
+        output_path='.',
+        object_type='channels',
+        flat=False):
+    """Write a PyMOL trajectory visualization script.
+
+    Parameters
+    ----------
+    pqr_file : str or pathlib.Path
+        PQR file containing the CaviTracer trajectory data.
+
+    atoms : Atomic
+        Molecular structure to display with the trajectory.
+
+    output_path : str or pathlib.Path, optional
+        Directory in which the protein PDB and PyMOL visualization script
+        are written. Default is the current directory.
+
+    object_type : str, optional
+        Type of CaviTracer object stored in the PQR. Accepted values are
+        'channels', 'pores', 'links', 'surface_cavities', and
+        'connected_cavities_channels'. Default is 'channels'.
+
+    flat : bool, optional
+        Select the trajectory visualization layout.
+
+        If False (default), generate the state-based viewer. Channels of the
+        same rank or cluster are combined into PyMOL objects whose states
+        correspond to trajectory frames.
+
+        If True, generate the flat viewer. Each channel instance remains a
+        separate PyMOL object, allowing externally generated clustering labels
+        to be applied to individual channels. The generated script accepts
+        one or more TSV label files and can save separate PSE sessions for
+        multiple clustering solutions.
+
+    Returns
+    -------
+    tuple
+        Paths to the PQR file, protein PDB file, and PyMOL script.
+    """
+
+    import os
+    from pathlib import Path
+
+    _requireCoords(atoms)
+
+    object_types = ('channels', 'pores', 'links', 'surface_cavities',
+                    'connected_cavities_channels')
+    if object_type not in object_types:
+        raise ValueError('object_type must be one of {0}'.format(
+            ', '.join(repr(name) for name in object_types)))
+
+    pqr_file = Path(pqr_file)
+    if not pqr_file.is_file():
+        raise ValueError('no PQR at {0}'.format(pqr_file))
+
+    output_path = Path(output_path)
+    if not output_path.exists():
+        output_path.mkdir(parents=True)
+    if not output_path.is_dir():
+        raise ValueError("output_path must be a directory")
+
+    # Use the same state-based viewer as per-frame trajectory files.  The
+    # generated script understands both a single multi-MODEL PQR and a glob of
+    # per-frame PQRs, so there is no longer a separate visualization pathway.
+    number = 0
+    while True:
+        suffix = '' if number == 0 else '-{0}'.format(number)
+        protein_file = output_path / ('protein' + suffix + '.pdb')
+        script_file = output_path / ('vis_channels_traj' + suffix + '.py')
+        if not (protein_file.exists() or script_file.exists()):
+            break
+        number += 1
+
+    writePDB(str(protein_file), atoms, csets=atoms.getACSIndex())
+
+    if flat:
+        script = _VIS_CHANNELS_FLAT_TRAJ_SCRIPT
+    else:
+        script = _VIS_CHANNELS_TRAJ_SCRIPT
+
+
+    with open(str(script_file), 'w') as handle:
+        handle.write(script)
+
+    try:
+        named = os.path.relpath(str(pqr_file), str(output_path))
+    except ValueError:
+        named = str(pqr_file.resolve())
+
+    LOGGER.info("CaviTracer PyMOL files written:")
+    LOGGER.info("    protein: {0}".format(protein_file))
+    LOGGER.info("    results: {0}".format(pqr_file))
+    LOGGER.info("    PyMOL script: {0}".format(script_file))
+    LOGGER.info("View the result from {0} with: pymol {1} -- {2} {3}".format(
+        output_path, script_file.name, protein_file.name, named))
+
+
+def writeChimeraXCaviTracerScript(objects, atoms, object_type='channels',
+                                  surface=None, output_path='.', num_samples=5):
+    """Write CaviTracer results and a ChimeraX command script.
+
+    The function saves the supplied CaviTracer objects to a combined PQR file,
+    saves the molecular structure to a PDB file, and creates a ChimeraX command
+    file (.cxc) that loads and visualizes both files.
+
+    Channels, pores and chamber links are displayed as spheres using the
+    radii stored in the CaviTracer PQR file. Surface cavities are displayed
+    as molecular surfaces generated around the cavity marker atoms.
+    Connected surface-cavity/channel results display the cavity regions as
+    surfaces and the connected channels as spheres.
+
+    The protein is displayed as a cartoon together with a transparent
+    molecular surface.
+
+    :arg objects: CaviTracer objects to visualize.
+    :type objects: list or CaviTracer object
+
+    :arg atoms: Molecular structure displayed with the CaviTracer results.
+    :type atoms: :class:`.Atomic`
+
+    :arg object_type: Type of CaviTracer result. Accepted values are
+        ``'channels'``, ``'pores'``, ``'links'``,
+        ``'surface_cavities'`` and ``'connected_cavities_channels'``.
+        Default is ``'channels'``.
+    :type object_type: str
+
+    :arg surface: Surface information returned by
+        :func:`calcSurfaceCavities`. Required for ``'surface_cavities'`` and
+        ``'connected_cavities_channels'``.
+    :type surface: list or None
+
+    :arg output_path: Directory in which the PQR, PDB and ChimeraX command
+        files are saved. Default is the current directory.
+    :type output_path: str or pathlib.Path
+
+    :arg num_samples: Number of samples per tetrahedron used to represent
+        channels, pores and links. Default is 5.
+    :type num_samples: int
+
+    :returns: Paths to the result PQR file, protein PDB file and ChimeraX
+        command file.
+    :rtype: tuple  
+    
+    Usage:
+    p = parsePDB('1tqn')
+    atoms = p.select("protein")
+    channels, surface = calcChannels(atoms)
+    writeChimeraXCaviTracerScript(channels, atoms)
+    
+    Other CaviTracer objects:
+    writeChimeraXCaviTracerScript(pores, atoms, object_type='pores')
+
+    writeChimeraXCaviTracerScript(cavities, atoms, object_type='surface_cavities', 
+                                    surface=surface)
+
+    writeChimeraXCaviTracerScript(connected, atoms,
+                    object_type='connected_cavities_channels', surface=cavity_surface) 
+                    
+    Next (bash console): 
+    $ chimerax vis_channels.cxc  """
+
+    if PY3K:
+        from pathlib import Path
+    else:
+        from pathlib2 import Path
+
+    _requireCoords(atoms)
+
+    aliases = {
+        'channel': 'channels',
+        'channels': 'channels',
+        'pore': 'pores',
+        'pores': 'pores',
+        'link': 'links',
+        'links': 'links',
+        'cavity': 'surface_cavities',
+        'cavities': 'surface_cavities',
+        'surface_cavity': 'surface_cavities',
+        'surface_cavities': 'surface_cavities',
+        'connected': 'connected_cavities_channels',
+        'connected_cavity_channel': 'connected_cavities_channels',
+        'connected_cavities_channels': 'connected_cavities_channels'}
+
+    object_type = aliases.get(str(object_type).lower())
+
+    if object_type is None:
+        raise ValueError("object_type must be 'channels', 'pores', 'links', "
+                        "'surface_cavities' or 'connected_cavities_channels'")
+
+    if object_type in ('surface_cavities', 'connected_cavities_channels'):
+        if surface is None or len(surface) < 5:
+            raise ValueError("surface returned by calcSurfaceCavities() must be provided "
+                            "for object_type='{0}'.".format(object_type))
+
+    if objects is None:
+        raise ValueError("objects cannot be None")
+
+    if isinstance(objects, list):
+        if not objects:
+            raise ValueError("objects contains no CaviTracer objects to visualize")
+    else:
+        objects = [objects]
+
+    output_path = Path(output_path)
+
+    if not output_path.exists():
+        output_path.mkdir(parents=True)
+
+    if not output_path.is_dir():
+        raise ValueError("output_path must be a directory")
+
+    names = {'channels': ('channels', 'vis_channels'),
+            'pores': ('pores', 'vis_pores'),
+            'links': ('links', 'vis_links'),
+            'surface_cavities': ('cavities', 'vis_surface_cavities'),
+            'connected_cavities_channels':
+                ('connected_cavities_channels',
+                'vis_connected_cavities_channels')}
+
+    result_stem, script_stem = names[object_type]
+    number = 0
+
+    while True:
+        suffix = '' if number == 0 else '-{0}'.format(number)
+
+        result_file = output_path / (result_stem + suffix + '.pqr')
+        protein_file = output_path / ('protein' + suffix + '.pdb')
+        script_file = output_path / (script_stem + suffix + '.cxc')
+
+        if not (result_file.exists() or
+                protein_file.exists() or
+                script_file.exists()):
+            break
+
+        number += 1
+
+    writePDB(str(protein_file), atoms)
+    _writeViewerPQR(result_file, objects, object_type, surface, num_samples)
+
+    _writeChimeraXScript(script_file, protein_file, result_file, object_type)
+
+    LOGGER.info("CaviTracer ChimeraX files written:")
+    LOGGER.info("    protein: {0}".format(protein_file))
+    LOGGER.info("    results: {0}".format(result_file))
+    LOGGER.info("    ChimeraX script: {0}".format(script_file))
+    LOGGER.info("View the result with: chimerax {0}".format(script_file.name))
+
+    return str(result_file), str(protein_file), str(script_file)
+
+
+def _writeChimeraXScript(script_file, protein_file, result_file, object_type):
+    """Write the ChimeraX command file drawing the PQR *result_file* over the
+    structure *protein_file*.
+
+    What it colours is read from the PQR itself, the residues on each of its
+    chains, so a file written by :func:`writeChimeraXCaviTracerScript` and one
+    already on disk open alike. So do a single structure and a multi-model file
+    from :func:`mergeFramesPQR`: ChimeraX opens the latter as one submodel per
+    ``MODEL``, the colours reach every one of them, and the script names each
+    for its frame and shows the first, with a slider to step through the rest."""
+
+    from pathlib import Path
+
+    residues, frames = {}, []
+    with open(str(result_file)) as handle:
+        for line in handle:
+            if line.startswith('MODEL'):
+                frames.append(line[5:].strip())
+            elif line.startswith(('ATOM', 'HETATM')):
+                residues.setdefault(line[21], set()).add(int(line[22:26]))
+
+    protein_path = Path(protein_file).resolve().as_posix().replace('"', '\\"')
+    result_path = Path(result_file).resolve().as_posix().replace('"', '\\"')
+
+    lines = [
+        '# CaviTracer visualization for ChimeraX',
+        '#',
+        '# Open this file in ChimeraX or start ChimeraX with this file.',
+        '',
+        '# Start from a clean visualization.',
+        'close',
+        '',
+        '# Display settings.',
+        'graphics bgColor white',
+        'camera ortho',
+        '',
+        # coordsets: a structure of several models, such as a trajectory's
+        # frames, is read as one structure with a coordinate set per model.
+        # ChimeraX otherwise opens a submodel per model and draws them all at
+        # once, one on top of another.
+        '# Protein.',
+        'open "{0}" id #1 name Protein autoStyle false coordsets true'.format(
+            protein_path),
+        'hide #1 atoms,bonds',
+        'show #1 cartoons',
+        'color #1 lightgray target c',
+        'surface #1',
+        'color #1 lightgray target s',
+        'transparency #1 65 target s',
+        '',
+        # combineSymAtoms: by default ChimeraX merges atoms of one name that sit
+        # at nearly one position, as on a symmetry axis. Every sphere here is a
+        # hydrogen of its channel's residue, so it would merge spheres that
+        # merely lie close, and the copies of a cavity written once per channel.
+        '# CaviTracer result.',
+        'open "{0}" id #2 name "CaviTracer {1}" autoStyle false atomic false '
+        'combineSymAtoms false'.format(
+            result_path, object_type.replace('_', ' '))]
+
+    # ChimeraX has no PQR reader of its own: the PDB reader takes the file, and
+    # the radius column is where a PDB keeps the B-factor. One command maps that
+    # onto the atom radius, as the line through 0.01:0.01 and 1000:1000 is the
+    # identity (a waypoint must be above zero). One size command per sphere did
+    # the same a command at a time, which took over a minute once there were
+    # thousands of spheres.
+    lines.extend(['', '# Set the CaviTracer radii, read into the B-factor.',
+                  'size byattribute bfactor #2 0.01:0.01 1000:1000', ''])
+
+    if object_type in ('channels', 'pores', 'links'):
+        lines.extend([
+            'hide #2 atoms,bonds',
+            'show #2 atoms',
+            'style #2 sphere',
+            ''])
+
+        # The palette of the PyMOL and VMD scripts, so that a channel is the
+        # same colour whichever of them shows it. An object's residue number is
+        # its rank plus one, in every frame.
+        for resid in sorted(residues.get('T', ())):
+            lines.append('color #2/T:{0} {1} target a'.format(
+                resid, _hexColour(resid - 1)))
+
+    elif object_type == 'surface_cavities':
+
+        lines.extend(['hide #2 atoms,bonds', ''])
+
+        for resid in sorted(residues.get('T', ())):
+            lines.append('surface #2/T:{0}'.format(resid))
+            lines.append('color #2/T:{0} {1} target s'.format(
+                resid, _hexColour(resid - 1)))
+
+    else:
+        lines.extend(['hide #2 atoms,bonds', 'show #2/H atoms', 'style #2/H sphere', ''])
+
+        # Cavities on chain C, channels on chain H, numbered by their own
+        # indices; coloured in turn, the channels after the cavities.
+        cavity_resids = sorted(residues.get('C', ()))
+        channel_resids = sorted(residues.get('H', ()))
+
+        lines.append('# Connected surface cavities.')
+
+        for i, resid in enumerate(cavity_resids):
+            lines.append('surface #2/C:{0}'.format(resid))
+            lines.append('color #2/C:{0} {1} target s'.format(resid, _hexColour(i)))
+
+        lines.append('')
+        lines.append('# Connected channels.')
+
+        offset = len(cavity_resids)
+
+        for i, resid in enumerate(channel_resids):
+            lines.append('color #2/H:{0} {1} target a'.format(
+                resid, _hexColour(i + offset)))
+
+    if len(frames) > 1:
+        lines.extend(['', '# One submodel per frame: each named for its frame, the '
+                      'first shown and a slider to step through the rest.'])
+        for number, frame in enumerate(frames, start=1):
+            lines.append('rename #2.{0} "frame {1}"'.format(number, frame))
+        lines.extend(['hide #2.2-{0} models'.format(len(frames)), 'mseries slider #2'])
+
+    lines.extend(['', '# Fit the complete system to the window.',
+        'view', '', 'log text CaviTracer visualization ready.'])
+
+    with open(str(script_file), 'w') as handle:
+        handle.write('\n'.join(lines) + '\n')
+
+
+def writeChimeraXMultiModelScript(pqr_file, atoms, output_path='.',
+                                  object_type='channels'):
+    """Write a ChimeraX command file for a PQR already on disk, such as the
+    multi-model one :func:`mergeFramesPQR` writes.
+
+    ChimeraX opens a multi-model PQR as one submodel per frame. The script names
+    each for its frame, shows the first and adds a slider to step through the
+    rest, and colours every object by its rank in its own frame, as
+    :func:`writeChimeraXCaviTracerScript` does for one structure. A PQR of one
+    structure opens just as that function would have drawn it.
+
+    Rank is all that ties an object to its namesakes in other frames: channel 3
+    of one frame and channel 3 of the next are the fourth cheapest of each, not
+    one channel followed through the trajectory.
+
+    :arg pqr_file: the PQR to draw, one structure or several frames.
+    :type pqr_file: str
+
+    :arg atoms: structure to draw the objects against. Its active coordinate
+        set is written, a single backdrop for every frame.
+    :type atoms: :class:`.Atomic`
+
+    :arg output_path: directory the structure and the script are written to.
+        The script opens the PQR where it is. Default is the current directory.
+    :type output_path: str
+
+    :arg object_type: what the PQR holds: ``'channels'`` (the default),
+        ``'pores'``, ``'links'``, ``'surface_cavities'`` or
+        ``'connected_cavities_channels'``, as in
+        :func:`writeChimeraXCaviTracerScript`.
+    :type object_type: str
+
+    :returns: paths to the PQR, the structure PDB and the ChimeraX script
+    :rtype: tuple
+
+    Usage:
+    mergeFramesPQR('frames', 'channels_frames.pqr')
+    writeChimeraXMultiModelScript('channels_frames.pqr', atoms)
+
+    Next (bash console):
+    $ chimerax vis_channels_frames.cxc"""
+
+    from pathlib import Path
+
+    _requireCoords(atoms)
+
+    object_types = ('channels', 'pores', 'links', 'surface_cavities',
+                    'connected_cavities_channels')
+    if object_type not in object_types:
+        raise ValueError('object_type must be one of {0}'.format(
+            ', '.join(repr(name) for name in object_types)))
+
+    pqr_file = Path(pqr_file)
+    if not pqr_file.is_file():
+        raise ValueError('no PQR at {0}'.format(pqr_file))
+
+    output_path = Path(output_path)
+    if not output_path.exists():
+        output_path.mkdir(parents=True)
+    if not output_path.is_dir():
+        raise ValueError("output_path must be a directory")
+
+    number = 0
+    while True:
+        suffix = '' if number == 0 else '-{0}'.format(number)
+        protein_file = output_path / ('protein' + suffix + '.pdb')
+        script_file = output_path / ('vis_' + pqr_file.stem + suffix + '.cxc')
+        if not (protein_file.exists() or script_file.exists()):
+            break
+        number += 1
+
+    # The active frame only: written whole, a trajectory's structure would come
+    # out as a model per frame, all of them drawn at once behind the channels.
+    writePDB(str(protein_file), atoms, csets=atoms.getACSIndex())
+    _writeChimeraXScript(script_file, protein_file, pqr_file, object_type)
+
+    LOGGER.info("CaviTracer ChimeraX files written:")
+    LOGGER.info("    protein: {0}".format(protein_file))
+    LOGGER.info("    results: {0}".format(pqr_file))
+    LOGGER.info("    ChimeraX script: {0}".format(script_file))
+    LOGGER.info("View the result with: chimerax {0}".format(script_file.name))
+
+    return str(pqr_file), str(protein_file), str(script_file)
